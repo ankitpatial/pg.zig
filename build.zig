@@ -63,16 +63,8 @@ pub fn build(b: *std.Build) !void {
     }
 
     {
-        // test step — always built with openssl enabled
-        const Translator = @import("translate_c").Translator;
-        const translate_c = b.dependency("translate_c", .{});
-        const t: Translator = .init(translate_c, .{
-            .c_source_file = b.path("src/openssl.h"),
-            .target = target,
-            .optimize = optimize,
-        });
-        if (openssl_include_path) |p| t.addIncludePath(p);
-
+        // test step: std TLS by default, OpenSSL with -Dopenssl=true, the
+        // same switch as the module.
         const lib_test = b.addTest(.{
             .root_module = b.createModule(.{
                 .target = target,
@@ -81,21 +73,25 @@ pub fn build(b: *std.Build) !void {
                 .imports = &.{
                     .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
                     .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
-                    .{ .name = "openssl", .module = t.mod },
+                    .{ .name = "openssl", .module = openssl_module },
                 },
             }),
             .use_llvm = true,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
-        if (openssl_lib_path) |p|
-            lib_test.root_module.addLibraryPath(p);
-        lib_test.root_module.linkSystemLibrary("crypto", .{});
-        lib_test.root_module.linkSystemLibrary("ssl", .{});
+        if (openssl) {
+            if (openssl_lib_path) |p| lib_test.root_module.addLibraryPath(p);
+            lib_test.root_module.linkSystemLibrary("crypto", .{});
+            lib_test.root_module.linkSystemLibrary("ssl", .{});
+            lib_test.root_module.link_libc = true;
+        }
 
         {
             const options = b.addOptions();
-            options.addOption(bool, "openssl", true);
+            options.addOption(bool, "openssl", openssl);
             options.addOption(bool, "column_names", false);
+            // Run the suite against a server on another port: -Dtest_port=54329.
+            options.addOption(u16, "test_port", b.option(u16, "test_port", "Port of the test server (default 5432)") orelse 5432);
             lib_test.root_module.addOptions("config", options);
         }
 

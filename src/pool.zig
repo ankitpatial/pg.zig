@@ -84,23 +84,24 @@ pub const Pool = struct {
         }
 
         var ssl_ctx: ?*SSLCtx = null;
-        if (comptime lib.has_openssl) {
-            switch (opts.connect.tls) {
-                .off => {},
-                else => |tls_config| {
-                    if (opts_copy.connect.host) |h| {
-                        opts_copy.connect._hostz = try aa.dupeZ(u8, h);
-                    }
-                    // the cert path is re-read on every (re)connect, so own it too
-                    switch (tls_config) {
-                        .verify_full => |path| if (path) |p| {
-                            opts_copy.connect.tls = .{ .verify_full = try aa.dupe(u8, p) };
-                        },
-                        else => {},
-                    }
-                    ssl_ctx = try lib.initializeSSLContext(tls_config);
-                },
-            }
+        switch (opts.connect.tls) {
+            .off => {},
+            else => |tls_config| {
+                if (opts_copy.connect.host) |h| {
+                    opts_copy.connect._hostz = try aa.dupeZ(u8, h);
+                }
+                switch (tls_config) {
+                    .verify_full => |path| if (path) |p| {
+                        opts_copy.connect.tls = .{ .verify_full = try aa.dupe(u8, p) };
+                    },
+                    .verify_ca => |path| if (path) |p| {
+                        opts_copy.connect.tls = .{ .verify_ca = try aa.dupe(u8, p) };
+                    },
+                    else => {},
+                }
+                // One context (and CA bundle) for every connection of the pool.
+                ssl_ctx = try lib.initializeSSLContext(io, allocator, tls_config);
+            },
         }
         errdefer lib.freeSSLContext(ssl_ctx);
         const connect_on_init_count = opts.connect_on_init_count orelse size;
@@ -714,7 +715,7 @@ test "Pool: initUri owns its connection strings" {
     // Heap-allocate the URI string and free it right after init to prove the pool
     // doesn't retain pointers into it. %73 == 's': decodes to "postgres" while also
     // forcing Uri to allocate a decoded copy into the parse arena.
-    const uri_str = try t.allocator.dupe(u8, "postgresql://postgre%73:postgres@127.0.0.1:5432/postgres");
+    const uri_str = try t.allocator.dupe(u8, std.fmt.comptimePrint("postgresql://postgre%73:postgres@127.0.0.1:{d}/postgres", .{lib.default_port}));
     const uri = try std.Uri.parse(uri_str);
 
     var pool = try Pool.initUri(t.io, t.allocator, uri, .{ .size = 2 });

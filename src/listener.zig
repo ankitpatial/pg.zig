@@ -36,8 +36,16 @@ pub const Listener = struct {
 
     _io: Io,
 
+    _ssl_ctx: ?*lib.SSLCtx = null,
+
     pub fn open(io: Io, allocator: Allocator, opts: Conn.Opts) !Listener {
-        var stream = try Stream.connect(io, allocator, opts, null);
+        const ssl_ctx: ?*lib.SSLCtx = switch (opts.tls) {
+            .off => null,
+            else => |tls_config| try lib.initializeSSLContext(io, allocator, tls_config),
+        };
+        errdefer lib.freeSSLContext(ssl_ctx);
+
+        var stream = try Stream.connect(io, allocator, opts, ssl_ctx);
         errdefer stream.close();
 
         const buf = try Buffer.init(allocator, opts.write_buffer orelse 2048);
@@ -52,6 +60,7 @@ pub const Listener = struct {
             ._reader = reader,
             ._allocator = allocator,
             ._io = io,
+            ._ssl_ctx = ssl_ctx,
         };
     }
 
@@ -64,6 +73,7 @@ pub const Listener = struct {
 
         self.stop() catch {};
         self._stream.close();
+        lib.freeSSLContext(self._ssl_ctx);
     }
 
     pub fn stop(self: *Listener) !void {

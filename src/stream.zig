@@ -12,7 +12,10 @@ const Io = std.Io;
 
 const DEFAULT_HOST = "127.0.0.1";
 
-pub const Stream = if (lib.has_openssl) TLSStream else PlainStream;
+pub const Stream = if (lib.has_openssl) TLSStream else StdTlsStream;
+
+/// PostgreSQL's SSLRequest: length 8, code 80877103.
+const ssl_request = [_]u8{ 0, 0, 0, 8, 4, 210, 22, 47 };
 
 const TLSStream = struct {
     valid: bool,
@@ -29,10 +32,13 @@ const TLSStream = struct {
         var ssl: ?*openssl.SSL = null;
         if (ctx_) |ctx| {
             // PostgreSQL TLS starts off as a plain connection which we upgrade
-            try writeStream(stream, io, &.{ 0, 0, 0, 8, 4, 210, 22, 47 });
+            try writeStream(stream, io, &ssl_request);
             var buf = [1]u8{0};
             _ = try readStream(stream, io, &buf);
             if (buf[0] != 'S') {
+                if (buf[0] == 'N' and opts.tls == .prefer) {
+                    return .{ .ssl = null, .valid = true, .stream = stream, .io = io };
+                }
                 return error.SSLNotSupportedByServer;
             }
 
@@ -57,7 +63,7 @@ const TLSStream = struct {
                     }
                 }
                 switch (opts.tls) {
-                    .verify_full => openssl.SSL_set_verify(ssl, openssl.SSL_VERIFY_PEER, null),
+                    .verify_full, .verify_ca => openssl.SSL_set_verify(ssl, openssl.SSL_VERIFY_PEER, null),
                     else => {},
                 }
             }
@@ -134,6 +140,139 @@ const TLSStream = struct {
     }
 };
 
+/// StdTlsStream upgrades the plain socket with std.crypto.tls after the
+/// SSLRequest. Reads and writes go through std.Io, so a cancel reaches
+/// them. The session lives on the heap: Reader copies the Stream by value,
+/// and tls.Client keeps pointers to the socket reader and writer.
+///
+/// Limits of std's client, both absent from PostgreSQL in practice unless
+/// configured: a server with ssl_ca_file set sends a CertificateRequest,
+/// which std cannot answer (the handshake fails, TlsUnexpectedMessage);
+/// and a server-sent KeyUpdate is neither answered nor safe against a
+/// concurrent write (Listener.stop writes from another thread).
+const StdTlsStream = struct {
+    io: Io,
+    stream: Io.net.Stream,
+    allocator: Allocator,
+    /// Null for a plain connection (tls = off, or prefer and the server said no).
+    session: ?*Session,
+
+    const TlsClient = std.crypto.tls.Client;
+
+    const Session = struct {
+        client: TlsClient,
+        socket_reader: Io.net.Stream.Reader,
+        socket_writer: Io.net.Stream.Writer,
+        socket_read_buf: [TlsClient.min_buffer_len]u8,
+        socket_write_buf: [TlsClient.min_buffer_len]u8,
+        tls_read_buf: [TlsClient.min_buffer_len]u8,
+        tls_write_buf: [TlsClient.min_buffer_len]u8,
+    };
+
+    pub fn connect(io: Io, allocator: Allocator, opts: Conn.Opts, ctx_: ?*lib.SSLCtx) !Stream {
+        const plain = try PlainStream.connect(io, allocator, opts, null);
+        errdefer plain.close();
+
+        var self: Stream = .{ .io = io, .stream = plain.stream, .allocator = allocator, .session = null };
+        const ctx = ctx_ orelse return self;
+
+        try writeStream(plain.stream, io, &ssl_request);
+        // One byte, unbuffered: anything after it belongs to the handshake
+        // (and a server must not send more; CVE-2021-23222).
+        var answer = [1]u8{0};
+        if (try readStream(plain.stream, io, &answer) != 1) return error.SSLNotSupportedByServer;
+        switch (answer[0]) {
+            'S' => {},
+            'N' => {
+                if (opts.tls == .prefer) return self;
+                return error.SSLNotSupportedByServer;
+            },
+            else => return error.SSLNotSupportedByServer,
+        }
+
+        const host = opts.host orelse DEFAULT_HOST;
+        const host_option = try ctx.hostOption(host);
+
+        const session = try allocator.create(Session);
+        errdefer allocator.destroy(session);
+        session.socket_reader = plain.stream.reader(io, &session.socket_read_buf);
+        session.socket_writer = plain.stream.writer(io, &session.socket_write_buf);
+
+        var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
+        io.random(&entropy);
+        session.client = TlsClient.init(&session.socket_reader.interface, &session.socket_writer.interface, .{
+            .host = host_option,
+            .ca = ctx.caOption(),
+            .read_buffer = &session.tls_read_buf,
+            .write_buffer = &session.tls_write_buf,
+            .entropy = &entropy,
+            .realtime_now = Io.Clock.real.now(io),
+        }) catch |err| switch (err) {
+            error.ReadFailed => return session.socket_reader.err orelse err,
+            error.WriteFailed => return session.socket_writer.err orelse err,
+            else => |e| return e,
+        };
+
+        self.session = session;
+        return self;
+    }
+
+    pub fn close(self: *Stream) void {
+        if (self.session) |session| {
+            // close_notify, best effort: the socket may already be gone.
+            session.client.end() catch {};
+            session.socket_writer.interface.flush() catch {};
+            self.allocator.destroy(session);
+            self.session = null;
+        }
+        self.stream.close(self.io);
+    }
+
+    pub fn shutdown(self: *const Stream, how: Io.net.ShutdownHow) !void {
+        return self.stream.shutdown(self.io, how);
+    }
+
+    pub fn writeAll(self: *const Stream, data: []const u8) !void {
+        const session = self.session orelse return writeStream(self.stream, self.io, data);
+        const w = &session.client.writer;
+        w.writeAll(data) catch return session.socket_writer.err orelse error.WriteFailed;
+        w.flush() catch return session.socket_writer.err orelse error.WriteFailed;
+        session.socket_writer.interface.flush() catch return session.socket_writer.err orelse error.WriteFailed;
+    }
+
+    pub fn read(self: *const Stream, buf: []u8) !usize {
+        const session = self.session orelse return readStream(self.stream, self.io, buf);
+        const r = &session.client.reader;
+
+        // A fill can decrypt a record with no application data (a TLS 1.3
+        // session ticket, say): zero bytes that are not end of stream.
+        // pg's Reader treats 0 as closed, so fill until bytes arrive.
+        var fills: usize = 0;
+        while (r.bufferedLen() == 0) : (fills += 1) {
+            if (fills == max_empty_records) return error.TlsTooManyEmptyRecords;
+            r.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return err,
+                error.ReadFailed => {
+                    // The TLS layer's own failure first (bad MAC, alert), else the socket's.
+                    if (session.client.read_err) |e| return e;
+                    return session.socket_reader.err orelse err;
+                },
+            };
+        }
+
+        const n = @min(buf.len, r.bufferedLen());
+        @memcpy(buf[0..n], r.buffered()[0..n]);
+        r.toss(n);
+        return n;
+    }
+
+    /// Fills without application data tolerated in a row before a read gives
+    /// up. A fill also returns nothing while a record is still arriving, so
+    /// a 16 KB record over a slow link takes many; each fill blocks for at
+    /// least one byte, so a generous bound costs nothing.
+    const max_empty_records = 1024;
+};
+
 const PlainStream = struct {
     io: Io,
     stream: Io.net.Stream,
@@ -150,7 +289,7 @@ const PlainStream = struct {
                 const addr: Io.net.UnixAddress = try .init(host);
                 break :blk addr.connect(io);
             }
-            const port = opts.port orelse 5432;
+            const port = opts.port orelse lib.default_port;
             const hostname: Io.net.HostName = try .init(host);
             break :blk hostname.connect(io, port, .{ .mode = .stream });
         };

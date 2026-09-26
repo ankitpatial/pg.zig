@@ -95,7 +95,16 @@ pub const Conn = struct {
 
         pub const TLS = union(enum) {
             off: void,
+            /// TLS if the server offers it, else plain; nothing verified.
+            prefer: void,
+            /// TLS, nothing verified.
             require: void,
+            /// TLS; the certificate must chain to this CA file (null: the
+            /// OS trust store). The host name is not checked.
+            verify_ca: ?[]const u8,
+            /// As verify_ca, and the certificate must name the host. With
+            /// -Dopenssl=true the host name is sent (SNI) but not checked:
+            /// there it is verify_ca.
             verify_full: ?[]const u8,
         };
     };
@@ -143,12 +152,7 @@ pub const Conn = struct {
         var ssl_ctx: ?*SSLCtx = null;
         switch (opts.tls) {
             .off => {},
-            else => |tls_config| {
-                if (comptime lib.has_openssl == false) {
-                    return error.OpenSSLNotConfigured;
-                }
-                ssl_ctx = try lib.initializeSSLContext(tls_config);
-            },
+            else => |tls_config| ssl_ctx = try lib.initializeSSLContext(io, allocator, tls_config),
         }
         errdefer lib.freeSSLContext(ssl_ctx);
         var conn = try openWithContext(io, allocator, opts, ssl_ctx);
@@ -2090,7 +2094,7 @@ test "PG: rollback during error" {
 }
 
 test "open URI" {
-    const uri = try std.Uri.parse("postgresql://postgres:postgres@127.0.0.1:5432/postgres?tcp_user_timeout=5000");
+    const uri = try std.Uri.parse(std.fmt.comptimePrint("postgresql://postgres:postgres@127.0.0.1:{d}/postgres?tcp_user_timeout=5000", .{lib.default_port}));
     var conn = try Conn.openAndAuthUri(t.io, t.allocator, uri);
     conn.deinit();
 }
@@ -2110,12 +2114,44 @@ test "Conn: TLS required" {
 }
 
 test "Conn: TLS verify-full" {
-    try t.expectError(error.SSLCertificationVerificationError, Conn.open(t.io, t.allocator, .{ .tls = .{ .verify_full = null } }));
+    // The test server's certificate is self-signed: the OS store rejects it.
+    const untrusted = if (comptime has_openssl) error.SSLCertificationVerificationError else error.TlsCertificateNotVerified;
+    try t.expectError(untrusted, Conn.open(t.io, t.allocator, .{ .host = "localhost", .tls = .{ .verify_full = null } }));
 
     {
-        var conn = try t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
+        var conn = try t.connect(.{ .host = "localhost", .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
         defer conn.deinit();
+        try t.expectEqual(true, try sslInUse(&conn));
     }
+
+    if (comptime has_openssl == false) {
+        // std checks DNS names only; an IP host cannot be verified in full.
+        try t.expectError(error.VerifyFullNeedsHostName, Conn.open(t.io, t.allocator, .{ .host = "127.0.0.1", .tls = .{ .verify_full = "tests/root.crt" } }));
+    }
+}
+
+test "Conn: TLS verify-ca and prefer" {
+    {
+        // verify-ca checks the chain, not the name: an IP host is fine.
+        var conn = try t.connect(.{ .host = "127.0.0.1", .tls = Conn.Opts.TLS{ .verify_ca = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
+        defer conn.deinit();
+        try t.expectEqual(true, try sslInUse(&conn));
+    }
+    {
+        var conn = try t.connect(.{ .tls = Conn.Opts.TLS.prefer, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
+        defer conn.deinit();
+        try t.expectEqual(true, try sslInUse(&conn));
+    }
+    {
+        const untrusted = if (comptime has_openssl) error.SSLCertificationVerificationError else error.TlsCertificateNotVerified;
+        try t.expectError(untrusted, Conn.open(t.io, t.allocator, .{ .tls = .{ .verify_ca = null } }));
+    }
+}
+
+fn sslInUse(conn: *Conn) !bool {
+    var row = (try conn.row("select ssl from pg_stat_ssl where pid = pg_backend_pid()", .{})).?;
+    defer row.deinit() catch {};
+    return row.get(bool, 0);
 }
 
 test "Conn: query is cancelable" {

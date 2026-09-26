@@ -17,8 +17,13 @@ pub const Stream = @import("stream.zig").Stream;
 pub const sendTerminate = @import("stream.zig").sendTerminate;
 pub const metrics = @import("metrics.zig");
 pub const has_openssl = build_config.openssl;
-pub const SSLCtx = if (has_openssl) openssl.SSL_CTX else void;
+/// Shared by a pool's connections: an OpenSSL context, or (the default)
+/// std_tls.Context with the CA bundle.
+pub const SSLCtx = if (has_openssl) openssl.SSL_CTX else std_tls.Context;
+pub const std_tls = @import("std_tls.zig");
 pub const default_column_names = build_config.column_names;
+/// 5432, except in the test build, which can point at another server.
+pub const default_port: u16 = if (@hasDecl(build_config, "test_port")) build_config.test_port else 5432;
 
 const result = @import("result.zig");
 pub const Row = result.Row;
@@ -196,7 +201,11 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
     } };
 }
 
-pub fn initializeSSLContext(config: Conn.Opts.TLS) !*SSLCtx {
+pub fn initializeSSLContext(io: std.Io, allocator: std.mem.Allocator, config: Conn.Opts.TLS) !*SSLCtx {
+    if (comptime has_openssl == false) {
+        return std_tls.Context.init(io, allocator, config);
+    }
+
     // OpenSSL documentation says these are implicitly called, and only need to
     // be called if you're doing something special
 
@@ -220,8 +229,8 @@ pub fn initializeSSLContext(config: Conn.Opts.TLS) !*SSLCtx {
     _ = openssl.SSL_CTX_set_mode(ctx, openssl.SSL_MODE_AUTO_RETRY);
 
     switch (config) {
-        .off, .require => {},
-        .verify_full => |path_to_root| {
+        .off, .prefer, .require => {},
+        .verify_full, .verify_ca => |path_to_root| {
             if (path_to_root) |p| {
                 var pathz: [std.fs.max_path_bytes + 1]u8 = undefined;
                 @memcpy(pathz[0..p.len], p);
@@ -249,6 +258,7 @@ pub fn initializeSSLContext(config: Conn.Opts.TLS) !*SSLCtx {
 
 pub fn freeSSLContext(ctx: ?*SSLCtx) void {
     if (comptime has_openssl == false) {
+        if (ctx) |c| c.deinit();
         return;
     }
 
