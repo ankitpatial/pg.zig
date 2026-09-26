@@ -35,6 +35,18 @@ pub const Pool = struct {
         connect: Conn.Opts = .{},
         timeout: u32 = 10 * std.time.ms_per_s,
         connect_on_init_count: ?u16 = null,
+        /// Milliseconds for one dial: TCP, TLS and auth. null: no deadline
+        /// beyond the OS's own.
+        connect_timeout: ?u32 = null,
+        /// Milliseconds a connection lives; an older one is replaced when it
+        /// is released, so that release may dial (up to connect_timeout).
+        /// Each connection's lifetime is shortened by up to 10 % so they do
+        /// not all reconnect together. null: forever.
+        max_lifetime: ?u32 = null,
+        /// Milliseconds a connection may sit idle before `acquire` checks it
+        /// with `SELECT 1` (traced like any statement); a failed or late
+        /// check replaces it, all within `timeout`. null: never.
+        validate_after: ?u32 = null,
     };
 
     pub const Stats = struct {
@@ -202,15 +214,62 @@ pub const Pool = struct {
             const conn = conns[index];
             self._available = index;
             self._mutex.unlock(io);
-            return conn;
+
+            // The check and a replacement dial both spend the acquire
+            // budget: a half-open connection must not hold acquire past
+            // its timeout (the query timeout is inert in this driver).
+            if (self.stillUsable(conn, remainingMs(io, start, deadline))) return conn;
+
+            // A dead connection is replaced now; if that dial fails too, the
+            // loop takes the next one (or waits) while the reconnector retries.
+            if (self.replace(conn, remainingMs(io, start, deadline))) |fresh| return fresh;
+            // Uncancelable: the errdefer above unlocks, so the lock must be held.
+            self._mutex.lockUncancelable(io);
         }
+    }
+
+    /// stillUsable runs `SELECT 1` on a connection idle past validate_after,
+    /// within `budget_ms`: neither the socket nor the protocol state shows a
+    /// backend that died while the connection sat in the pool. The check
+    /// goes through the trace hook like any statement.
+    fn stillUsable(self: *Pool, conn: *Conn, budget_ms: u32) bool {
+        const after_ms = self._opts.validate_after orelse return true;
+        const idle_since = conn._idle_since orelse return true;
+        const idle = idle_since.durationTo(Io.Timestamp.now(self._io, .awake));
+        if (idle.toMilliseconds() < after_ms) return true;
+
+        return checkWithin(self._io, conn, budget_ms);
+    }
+
+    /// replace closes a connection that must not be reused and dials its
+    /// successor within `budget_ms`. Null when that dial fails: the slot is
+    /// then missing and the reconnector retries in the background.
+    fn replace(self: *Pool, conn: *Conn, budget_ms: ?u32) ?*Conn {
+        const io = self._io;
+        conn.deinit();
+        self._allocator.destroy(conn);
+
+        return newConnectionWithin(self, true, budget_ms) catch {
+            self._mutex.lockUncancelable(io);
+            self._missing += 1;
+            self._mutex.unlock(io);
+            self._reconnector.reconnect() catch |err| {
+                log.err("background reconnector failed to start ({})", .{err});
+            };
+            return null;
+        };
     }
 
     pub fn release(self: *Pool, conn: *Conn) void {
         var conn_to_add = conn;
         const io = self._io;
 
-        if (conn._state != .idle) {
+        const expired = if (conn._retire_at) |at| Io.Timestamp.now(io, .awake).nanoseconds >= at.nanoseconds else false;
+        if (expired and conn._state == .idle) {
+            // Retired for age, not failure. The successor is dialled here, as
+            // for a dirty connection below (up to connect_timeout).
+            conn_to_add = self.replace(conn, null) orelse return;
+        } else if (conn._state != .idle) {
             lib.metrics.poolDirty();
             // conn should always be idle when being released. It's possible we can
             // recover from this (e.g. maybe we just need to read until we get a
@@ -234,6 +293,7 @@ pub const Pool = struct {
         }
 
         var conns = self._conns;
+        conn_to_add._idle_since = Io.Timestamp.now(io, .awake);
         self._mutex.lockUncancelable(io);
         const available = self._available;
         conns[available] = conn_to_add;
@@ -404,6 +464,27 @@ const Reconnector = struct {
 };
 
 fn newConnection(pool: *Pool, log_failure: bool) !*Conn {
+    return newConnectionWithin(pool, log_failure, null);
+}
+
+/// newConnectionWithin dials within connect_timeout, or within `max_ms`
+/// when that is shorter (what is left of an acquire).
+fn newConnectionWithin(pool: *Pool, log_failure: bool, max_ms: ?u32) !*Conn {
+    const limit: ?u32 = if (pool._opts.connect_timeout) |c| (if (max_ms) |m| @min(c, m) else c) else max_ms;
+    const conn = if (limit) |ms|
+        try dialWithin(pool, ms, log_failure)
+    else
+        try dial(pool, log_failure);
+
+    conn._pool = pool;
+    conn._idle_since = Io.Timestamp.now(pool._io, .awake);
+    conn._retire_at = retireAt(pool);
+    return conn;
+}
+
+/// dial opens and authenticates one connection with the pool's TLS context,
+/// so the CA bundle is loaded once per pool, not per connection.
+fn dial(pool: *Pool, log_failure: bool) !*Conn {
     const opts = &pool._opts;
     const allocator = pool._allocator;
     const io = pool._io;
@@ -414,14 +495,15 @@ fn newConnection(pool: *Pool, log_failure: bool) !*Conn {
     };
     errdefer allocator.destroy(conn);
 
-    conn.* = Conn.open(io, allocator, opts.connect) catch |err| {
-        if (log_failure) log.err("connect error: {}", .{err});
+    conn.* = Conn.openWithContext(io, allocator, opts.connect, pool._ssl_ctx) catch |err| {
+        // Canceled: a deadline (or the caller) stopped it; dialWithin logs that.
+        if (log_failure and err != error.Canceled) log.err("connect error: {}", .{err});
         return err;
     };
     errdefer conn.deinit();
 
     conn.auth(opts.auth) catch |err| {
-        if (log_failure) {
+        if (log_failure and err != error.Canceled) {
             if (conn.err) |pg_err| {
                 log.err("connect error: {s}", .{pg_err.message});
             } else {
@@ -430,8 +512,126 @@ fn newConnection(pool: *Pool, log_failure: bool) !*Conn {
         }
         return err;
     };
-    conn._pool = pool;
     return conn;
+}
+
+/// dialWithin races `dial` against a deadline. A dial that finishes after
+/// losing is closed, not leaked.
+fn dialWithin(pool: *Pool, ms: u32, log_failure: bool) !*Conn {
+    const io = pool._io;
+    const Race = union(enum) { dial: anyerror!*Conn, timeout: Io.Cancelable!void };
+    var buf: [2]Race = undefined;
+    var sel: Io.Select(Race) = .init(io, &buf);
+
+    // Without a unit of concurrency the dial still happens, undeadlined.
+    sel.concurrent(.timeout, sleepMs, .{ io, ms }) catch {
+        log.warn("no concurrency for a connect deadline; dialling without one", .{});
+        return dial(pool, log_failure);
+    };
+    sel.concurrent(.dial, dial, .{ pool, log_failure }) catch {
+        sel.cancelDiscard();
+        log.warn("no concurrency for a connect deadline; dialling without one", .{});
+        return dial(pool, log_failure);
+    };
+
+    const first = sel.await() catch |err| {
+        drainDial(pool, &sel);
+        // Awaiting consumed the caller's cancel; re-arm it for its next Io call.
+        io.recancel();
+        return err;
+    };
+    drainDial(pool, &sel);
+
+    return switch (first) {
+        .dial => |result| result,
+        .timeout => {
+            if (log_failure) log.err("connect error: no connection within {d} ms", .{ms});
+            return error.ConnectTimeout;
+        },
+    };
+}
+
+/// drainDial cancels what is still running and closes a connection that
+/// finished anyway. Two tasks, so two results at most.
+fn drainDial(pool: *Pool, sel: anytype) void {
+    var n: u8 = 0;
+    while (n < 2) : (n += 1) {
+        const other = sel.cancel() orelse return;
+        switch (other) {
+            .dial => |result| {
+                const conn = result catch continue;
+                conn.deinit();
+                pool._allocator.destroy(conn);
+            },
+            .timeout => {},
+        }
+    }
+}
+
+/// checkWithin runs `SELECT 1` on `conn`, giving up after `ms`. A check
+/// cut off mid-read leaves the connection unusable; the caller replaces it.
+fn checkWithin(io: Io, conn: *Conn, ms: u32) bool {
+    const Race = union(enum) { check: bool, timeout: Io.Cancelable!void };
+    var buf: [2]Race = undefined;
+    var sel: Io.Select(Race) = .init(io, &buf);
+
+    // Without a unit of concurrency the check still happens, undeadlined.
+    sel.concurrent(.timeout, sleepMs, .{ io, ms }) catch return check(conn);
+    sel.concurrent(.check, check, .{conn}) catch {
+        sel.cancelDiscard();
+        return check(conn);
+    };
+
+    const first = sel.await() catch {
+        sel.cancelDiscard();
+        // Awaiting consumed the caller's cancel; re-arm it for its next Io call.
+        io.recancel();
+        return false;
+    };
+    // Waits for the loser: the connection is not touched again until then.
+    sel.cancelDiscard();
+
+    return switch (first) {
+        .check => |ok| ok,
+        .timeout => {
+            log.warn("pooled connection did not answer its check within {d} ms; replacing it", .{ms});
+            return false;
+        },
+    };
+}
+
+fn check(conn: *Conn) bool {
+    _ = conn.execOpts("select 1", .{}, .{}) catch |err| {
+        log.warn("pooled connection failed its check ({}); replacing it", .{err});
+        return false;
+    };
+    return true;
+}
+
+/// remainingMs is what is left of an acquire's `deadline_ns` since `start`.
+fn remainingMs(io: Io, start: Io.Timestamp, deadline_ns: i64) u32 {
+    const elapsed = start.durationTo(Io.Timestamp.now(io, .awake)).toNanoseconds();
+    if (elapsed >= deadline_ns) return 0;
+    const left: u64 = @intCast(@divFloor(deadline_ns - @as(i64, @intCast(elapsed)), std.time.ns_per_ms));
+    return @intCast(@min(left, std.math.maxInt(u32)));
+}
+
+fn sleepMs(io: Io, ms: u32) Io.Cancelable!void {
+    return io.sleep(.fromMilliseconds(ms), .awake);
+}
+
+/// retireAt is when a new connection should be replaced: max_lifetime from
+/// now, less up to 10 % so a pool opened at once does not retire at once.
+fn retireAt(pool: *Pool) ?Io.Timestamp {
+    const ms = pool._opts.max_lifetime orelse return null;
+    const lifetime_ns: u64 = @as(u64, ms) * std.time.ns_per_ms;
+
+    var random: [8]u8 = undefined;
+    pool._io.random(&random);
+    const jitter = std.mem.readInt(u64, &random, .little) % (lifetime_ns / 10 + 1);
+
+    const now = Io.Timestamp.now(pool._io, .awake);
+    return .{ .nanoseconds = now.nanoseconds + @as(i96, lifetime_ns - jitter) };
 }
 
 const t = lib.testing;
@@ -491,6 +691,98 @@ test "Pool: deinit while the reconnector is retrying" {
     pool.deinit();
     const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds();
     try t.expectEqual(true, elapsed < std.time.ns_per_s);
+}
+
+test "Pool: connect_timeout cuts off a server that never answers" {
+    const io = t.io;
+
+    // Listening but never accepting: the kernel completes the TCP handshake,
+    // then nothing ever answers the startup message.
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    try t.expectError(error.ConnectTimeout, Pool.init(io, t.allocator, .{
+        .size = 1,
+        .connect_timeout = 200,
+        .connect = .{ .port = server.socket.address.ip4.port, .host = "127.0.0.1" },
+        .auth = t.authOpts(.{}),
+    }));
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    try t.expectEqual(true, elapsed >= 200);
+    try t.expectEqual(true, elapsed < 2000);
+}
+
+test "Pool: max_lifetime replaces an old connection on release" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .max_lifetime = 50, .auth = t.authOpts(.{}) });
+    defer pool.deinit();
+
+    const first = try backendPid(pool);
+    try std.Io.sleep(t.io, .fromMilliseconds(100), .awake);
+    // The release after that sleep retires the connection; the next acquire
+    // waits for the reconnector's replacement.
+    const second = try backendPid(pool);
+    const third = try backendPid(pool);
+    try t.expectEqual(true, first != third);
+    _ = second;
+}
+
+test "Pool: validate_after replaces a backend that died while idle" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .validate_after = 10, .auth = t.authOpts(.{}) });
+    defer pool.deinit();
+
+    const first = try backendPid(pool);
+    {
+        var killer = try t.connect(.{});
+        defer killer.deinit();
+        // Waits (up to 1 s) for the backend to exit.
+        _ = try killer.exec("select pg_terminate_backend($1, 1000)", .{first});
+    }
+    // Idle past validate_after (10 ms).
+    try std.Io.sleep(t.io, .fromMilliseconds(20), .awake);
+
+    // Without validation this acquire would hand out the dead connection.
+    const second = try backendPid(pool);
+    try t.expectEqual(true, first != second);
+}
+
+test "Pool: a hung check cannot hold acquire past its timeout" {
+    const io = t.io;
+    var pool = try Pool.init(io, t.allocator, .{
+        .size = 1,
+        .timeout = 300,
+        .validate_after = 10,
+        .connect_timeout = 200,
+        .auth = t.authOpts(.{}),
+    });
+    defer pool.deinit();
+
+    const pid = try backendPid(pool);
+    try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+
+    // A stopped backend never answers: the check hangs as on a half-open
+    // connection. Resumed (and terminated) whatever the outcome.
+    try std.posix.kill(pid, std.posix.SIG.STOP);
+    defer {
+        std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+    }
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    if (pool.acquire()) |conn| {
+        conn.release();
+    } else |_| {}
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    // timeout (300) bounds the check and the replacement dial together.
+    try t.expectEqual(true, elapsed < 1000);
+}
+
+fn backendPid(pool: *Pool) !i32 {
+    const conn = try pool.acquire();
+    defer conn.release();
+    var row = (try conn.row("select pg_backend_pid()", .{})).?;
+    defer row.deinit() catch {};
+    return row.get(i32, 0);
 }
 
 test "Pool: Release" {

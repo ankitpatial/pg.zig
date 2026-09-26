@@ -65,6 +65,12 @@ pub const Conn = struct {
     // cache_name => data necessary to re-execute previously prepared statement.
     _prepared_statements: std.hash_map.StringHashMapUnmanaged(Stmt.Describe),
 
+    /// Set by a Pool: when this connection is replaced for age (max_lifetime).
+    _retire_at: ?Io.Timestamp = null,
+
+    /// Set by a Pool on release: validate_after is measured from here.
+    _idle_since: ?Io.Timestamp = null,
+
     const State = enum {
         idle,
 
