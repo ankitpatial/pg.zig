@@ -21,6 +21,27 @@ pub const has_openssl = build_config.openssl;
 /// std_tls.Context with the CA bundle.
 pub const SSLCtx = if (has_openssl) openssl.SSL_CTX else std_tls.Context;
 pub const std_tls = @import("std_tls.zig");
+
+/// A statement hook, set with `Conn.Opts.trace` (for a pool: its `connect`
+/// options). Called once per `query`, `row` or `exec` with the SQL, never
+/// the values, from whichever thread ran the statement: concurrently when
+/// a pool's connections are busy. With no hook, no clock is read.
+pub const Trace = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (ctx: ?*anyopaque, event: *const TraceEvent) void,
+};
+
+pub const TraceEvent = struct {
+    sql: []const u8,
+    /// exec: until the statement completed. query/row: until the result
+    /// was ready to read; rows stream after that and are not counted.
+    duration_ns: u64,
+    /// exec: rows affected, when the statement reports them. query/row: null.
+    rows: ?i64,
+    err: ?anyerror,
+    /// The server's error, when `err` is error.PG. Valid during the call only.
+    pg: ?*const proto.Error,
+};
 pub const default_column_names = build_config.column_names;
 /// 5432, except in the test build, which can point at another server.
 pub const default_port: u16 = if (@hasDecl(build_config, "test_port")) build_config.test_port else 5432;

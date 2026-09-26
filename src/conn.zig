@@ -65,6 +65,8 @@ pub const Conn = struct {
     // cache_name => data necessary to re-execute previously prepared statement.
     _prepared_statements: std.hash_map.StringHashMapUnmanaged(Stmt.Describe),
 
+    _trace: ?lib.Trace = null,
+
     /// Set by a Pool: when this connection is replaced for age (max_lifetime).
     _retire_at: ?Io.Timestamp = null,
 
@@ -94,6 +96,9 @@ pub const Conn = struct {
         _hostz: ?[:0]const u8 = null,
 
         // tcp keepalive settings (null timer = OS default)
+        /// Called after each query, row and exec; see lib.Trace.
+        trace: ?lib.Trace = null,
+
         keepalive: bool = true,
         keepalive_idle: ?u32 = 30,
         keepalive_interval: ?u32 = 10,
@@ -195,6 +200,7 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
+            ._trace = opts.trace,
         };
     }
 
@@ -266,10 +272,42 @@ pub const Conn = struct {
     }
 
     pub fn queryOpts(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !*Result {
-        return self.doQuery(sql, values, opts) catch |err| {
+        const start = self.traceStart();
+        const result = self.doQuery(sql, values, opts) catch |err| {
+            // Traced before release: release clears self.err.
+            self.traceEnd(start, sql, null, err);
             self.maybeRelease(opts.release_conn);
             return err;
         };
+        self.traceEnd(start, sql, null, null);
+        return result;
+    }
+
+    /// traceStart reads the clock only when a trace hook is set.
+    fn traceStart(self: *const Conn) ?Io.Timestamp {
+        if (self._trace == null) return null;
+        return Io.Timestamp.now(self._io, .awake);
+    }
+
+    fn traceEnd(self: *Conn, start: ?Io.Timestamp, sql: []const u8, rows: ?i64, err: ?anyerror) void {
+        const began = start orelse return;
+        const trace = self._trace orelse return;
+        const elapsed = began.durationTo(Io.Timestamp.now(self._io, .awake)).toNanoseconds();
+
+        var pg: ?*const proto.Error = null;
+        if (err) |e| {
+            if (e == error.PG) {
+                if (self.err) |*pg_err| pg = pg_err;
+            }
+        }
+        const event: lib.TraceEvent = .{
+            .sql = sql,
+            .duration_ns = @intCast(@max(0, elapsed)),
+            .rows = rows,
+            .err = err,
+            .pg = pg,
+        };
+        trace.func(trace.ctx, &event);
     }
 
     fn doQuery(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !*Result {
@@ -379,6 +417,20 @@ pub const Conn = struct {
     }
 
     pub fn execOpts(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !?i64 {
+        const start = self.traceStart();
+        var released = false;
+        const affected = self.execUntraced(start, sql, values, opts, &released) catch |err| {
+            // A released connection may already belong to someone else.
+            if (!released) self.traceEnd(start, sql, null, err);
+            return err;
+        };
+        self.traceEnd(start, sql, affected, null);
+        return affected;
+    }
+
+    /// A failure that releases the connection (opts.release_conn) traces
+    /// before the release, from `start`, and sets `released`.
+    fn execUntraced(self: *Conn, start: ?Io.Timestamp, sql: []const u8, values: anytype, opts: QueryOpts, released: *bool) !?i64 {
         if (self.canQuery() == false) {
             return error.ConnectionBusy;
         }
@@ -407,7 +459,15 @@ pub const Conn = struct {
             //    Parse + Bind + Exec + Sync
             // Instead of having to do:
             //    Parse + Describe + Sync  ... read response ...  Bind + Exec + Sync
-            const result = try self.queryOpts(sql, values, opts);
+            // Not queryOpts: this statement is traced once, by execOpts.
+            const result = self.doQuery(sql, values, opts) catch |err| {
+                if (opts.release_conn) {
+                    self.traceEnd(start, sql, null, err);
+                    released.* = true;
+                    self.release();
+                }
+                return err;
+            };
             result.deinit();
         }
 
@@ -2103,6 +2163,78 @@ test "open URI" {
     const uri = try std.Uri.parse(std.fmt.comptimePrint("postgresql://postgres:postgres@127.0.0.1:{d}/postgres?tcp_user_timeout=5000", .{lib.default_port}));
     var conn = try Conn.openAndAuthUri(t.io, t.allocator, uri);
     conn.deinit();
+}
+
+test "Conn: trace sees each statement once, with the server's error" {
+    const Seen = struct {
+        count: usize = 0,
+        last_sql: [64]u8 = undefined,
+        last_sql_len: usize = 0,
+        last_rows: ?i64 = null,
+        last_err: ?anyerror = null,
+        last_code: [5]u8 = undefined,
+
+        fn record(ctx: ?*anyopaque, event: *const lib.TraceEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count += 1;
+            self.last_sql_len = @min(event.sql.len, self.last_sql.len);
+            @memcpy(self.last_sql[0..self.last_sql_len], event.sql[0..self.last_sql_len]);
+            self.last_rows = event.rows;
+            self.last_err = event.err;
+            if (event.pg) |pg| @memcpy(&self.last_code, pg.code[0..5]);
+        }
+    };
+    var seen: Seen = .{};
+
+    var conn = try Conn.open(t.io, t.allocator, .{ .trace = .{ .ctx = &seen, .func = Seen.record } });
+    defer conn.deinit();
+    try conn.auth(t.authOpts(.{}));
+
+    _ = try conn.exec("select 1 where $1 = 1", .{@as(i32, 1)});
+    try t.expectEqual(1, seen.count);
+    try t.expectEqual(1, seen.last_rows.?);
+
+    {
+        var row = (try conn.row("select 2", .{})).?;
+        row.deinit() catch {};
+    }
+    try t.expectEqual(2, seen.count);
+    try t.expectString("select 2", seen.last_sql[0..seen.last_sql_len]);
+    try t.expectEqual(null, seen.last_rows);
+
+    try t.expectError(error.PG, conn.exec("select * from no_such_table_for_trace", .{}));
+    try t.expectEqual(3, seen.count);
+    try t.expectEqual(error.PG, seen.last_err.?);
+    try t.expectString("42P01", &seen.last_code);
+}
+
+test "Conn: a traced exec that releases its connection is traced before the release" {
+    const Count = struct {
+        n: usize = 0,
+        code: [5]u8 = .{ 0, 0, 0, 0, 0 },
+        fn record(ctx: ?*anyopaque, event: *const lib.TraceEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.n += 1;
+            if (event.pg) |pg| @memcpy(&self.code, pg.code[0..5]);
+        }
+    };
+    var count: Count = .{};
+    var pool = try lib.Pool.init(t.io, t.allocator, .{
+        .size = 1,
+        .max_lifetime = 1,
+        .auth = t.authOpts(.{}),
+        .connect = .{ .trace = .{ .ctx = &count, .func = Count.record } },
+    });
+    defer pool.deinit();
+
+    // Past its lifetime, the connection is destroyed by the release inside
+    // execOpts (and its replacement often lands at the same address).
+    // Traced after the release, the event would have lost the server error.
+    const conn = try pool.acquire();
+    try std.Io.sleep(t.io, .fromMilliseconds(5), .awake);
+    try t.expectError(error.PG, conn.execOpts("select * from no_such_table_for_release where x = $1", .{1}, .{ .release_conn = true }));
+    try t.expectEqual(1, count.n);
+    try t.expectString("42P01", &count.code);
 }
 
 test "Conn: TLS required" {
