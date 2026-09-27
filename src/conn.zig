@@ -411,6 +411,125 @@ pub const Conn = struct {
         };
     }
 
+    /// One result column, as the server describes it.
+    pub const ColumnDescription = struct {
+        name: []const u8,
+        /// The table the column is read from; 0 for an expression.
+        table_oid: u32,
+        /// Its attribute number in that table (pg_attribute.attnum); 0 for
+        /// an expression.
+        column: i16,
+        type_oid: i32,
+        type_modifier: i32,
+    };
+
+    pub const Description = struct {
+        param_oids: []const i32,
+        columns: []const ColumnDescription,
+    };
+
+    /// describeQuery asks the server what `sql` takes and returns, without
+    /// running it: each parameter's type, and each result column's name,
+    /// type and origin (table and column), which is what a code generator
+    /// needs to tell NOT NULL columns from nullable ones. Uses the unnamed
+    /// statement, so cached prepared statements are untouched. The result
+    /// lives in `arena`.
+    pub fn describeQuery(self: *Conn, arena: Allocator, sql: []const u8) !Description {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+        try self._reader.startFlow(arena, null);
+        defer self._reader.endFlow() catch {
+            self._state = .fail;
+        };
+
+        var buf = &self._buf;
+        buf.reset();
+        {
+            // Parse (unnamed, no parameter types) + Describe statement + Sync.
+            const parse_len = 8 + sql.len;
+            const describe_len = 6;
+            const total = 3 + parse_len + describe_len + 4;
+            try buf.ensureTotalCapacity(total);
+            var view = buf.skip(total) catch unreachable;
+            view.writeByte('P');
+            view.writeIntBig(u32, @intCast(parse_len));
+            view.writeByte(0); // unnamed statement
+            view.write(sql);
+            view.write(&.{ 0, 0, 0 }); // sql's NUL, then 0 parameter types
+            view.writeByte('D');
+            view.writeIntBig(u32, @intCast(describe_len));
+            view.writeByte('S');
+            view.writeByte(0);
+            view.write(&.{ 'S', 0, 0, 0, 4 });
+        }
+        self._state = .query;
+        try self.write(buf.string());
+
+        // A refusal (at Parse, or rarely at Describe) is followed by
+        // ReadyForQuery; readDescribe consumes it so the connection is free.
+        const parsed = try self.readDescribe();
+        if (parsed.type != '1') return self.unexpectedDBMessage();
+
+        const params_msg = try self.readDescribe();
+        if (params_msg.type != 't') return self.unexpectedDBMessage();
+        const param_oids = try describeParams(arena, params_msg.data);
+
+        const rows_msg = try self.readDescribe();
+        const columns: []ColumnDescription = switch (rows_msg.type) {
+            'n' => &.{}, // NoData: the statement returns no rows
+            'T' => try describeColumns(arena, rows_msg.data),
+            else => return self.unexpectedDBMessage(),
+        };
+
+        try self.readyForQuery();
+        return .{ .param_oids = param_oids, .columns = columns };
+    }
+
+    fn readDescribe(self: *Conn) !lib.Message {
+        return self.read() catch |err| {
+            if (err == error.PG) try self.recoverFromError();
+            return err;
+        };
+    }
+
+    fn describeParams(arena: Allocator, data: []const u8) ![]const i32 {
+        if (data.len < 2) return error.InvalidMessage;
+        const count = std.mem.readInt(u16, data[0..2], .big);
+        if (data.len < 2 + @as(usize, count) * 4) return error.InvalidMessage;
+        const oids = try arena.alloc(i32, count);
+        for (oids, 0..) |*oid, i| {
+            const at = 2 + i * 4;
+            oid.* = std.mem.readInt(i32, data[at..][0..4], .big);
+        }
+        return oids;
+    }
+
+    /// describeColumns reads a RowDescription: per column, a NUL-terminated
+    /// name, then table oid (4), attnum (2), type oid (4), type size (2),
+    /// type modifier (4) and format code (2).
+    fn describeColumns(arena: Allocator, data: []const u8) ![]ColumnDescription {
+        if (data.len < 2) return error.InvalidMessage;
+        const count = std.mem.readInt(u16, data[0..2], .big);
+        const columns = try arena.alloc(ColumnDescription, count);
+        var pos: usize = 2;
+        for (columns) |*c| {
+            const nul = std.mem.indexOfScalarPos(u8, data, pos, 0) orelse return error.InvalidMessage;
+            const name = data[pos..nul];
+            pos = nul + 1;
+            if (data.len < pos + 18) return error.InvalidMessage;
+            c.* = .{
+                .name = try arena.dupe(u8, name),
+                .table_oid = std.mem.readInt(u32, data[pos..][0..4], .big),
+                .column = std.mem.readInt(i16, data[pos + 4 ..][0..2], .big),
+                .type_oid = std.mem.readInt(i32, data[pos + 6 ..][0..4], .big),
+                .type_modifier = std.mem.readInt(i32, data[pos + 12 ..][0..4], .big),
+            };
+            pos += 18;
+        }
+        return columns;
+    }
+
     // Execute a query that does not return rows
     pub fn exec(self: *Conn, sql: []const u8, values: anytype) !?i64 {
         return self.execOpts(sql, values, .{});
@@ -2235,6 +2354,38 @@ test "Conn: a traced exec that releases its connection is traced before the rele
     try t.expectError(error.PG, conn.execOpts("select * from no_such_table_for_release where x = $1", .{1}, .{ .release_conn = true }));
     try t.expectEqual(1, count.n);
     try t.expectString("42P01", &count.code);
+}
+
+test "Conn: describeQuery reports parameter types and column origins" {
+    var conn = try t.connect(.{});
+    defer conn.deinit();
+    _ = try conn.exec("drop table if exists describe_test", .{});
+    _ = try conn.exec("create table describe_test (id int not null, note text)", .{});
+    defer _ = conn.exec("drop table if exists describe_test", .{}) catch {};
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const d = try conn.describeQuery(arena.allocator(), "select id, note, id + 1 as next from describe_test where id = $1 and note = $2");
+    try t.expectEqual(2, d.param_oids.len);
+    try t.expectEqual(23, d.param_oids[0]); // int4
+    try t.expectEqual(25, d.param_oids[1]); // text
+    try t.expectEqual(3, d.columns.len);
+    try t.expectString("id", d.columns[0].name);
+    try t.expectEqual(1, d.columns[0].column);
+    try t.expectEqual(true, d.columns[0].table_oid != 0);
+    try t.expectEqual(2, d.columns[1].column);
+    try t.expectEqual(25, d.columns[1].type_oid);
+    // An expression has no origin.
+    try t.expectString("next", d.columns[2].name);
+    try t.expectEqual(0, d.columns[2].table_oid);
+    try t.expectEqual(0, d.columns[2].column);
+
+    // No rows returned: NoData, no columns. The connection is usable after.
+    const u = try conn.describeQuery(arena.allocator(), "delete from describe_test where id = $1");
+    try t.expectEqual(0, u.columns.len);
+    try t.expectError(error.PG, conn.describeQuery(arena.allocator(), "select * from no_such_table_for_describe"));
+    try t.expectString("42P01", conn.err.?.code);
+    _ = try conn.exec("select 1", .{});
 }
 
 test "Conn: TLS required" {
