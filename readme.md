@@ -5,7 +5,7 @@ A native PostgresSQL driver / client for Zig. Supports [LISTEN](#listen--notify)
 See or run [example/main.zig](https://github.com/karlseguin/pg.zig/blob/master/example/main.zig) for a number of examples.
 
 ## Zig Version
-This is for Zig 0.16.0. Use the [zig-0.15.2](https://github.com/karlseguin/pg.zig/tree/zig-0.15) branch for Zig 0.15 or the [dev](https://github.com/karlseguin/pg.zig/tree/dev) which may or may not be up to date with zig dev.
+This is for Zig 0.17.0. See branches for other versions.
 
 ## Install
 1) Add pg.zig as a dependency in your `build.zig.zon`:
@@ -268,6 +268,9 @@ When `.map = .ordinal`, the default, the order of the field names must match the
 When `.map = .name`, the query must be executed with the  `{.column_names = true}` option or the `column_names` build option must be set. Columns with no field equivalent are ignored. Fields with no column equivalent are set to their default value; if they do not have a default value the function will return `error.FieldColumnMismatch`. If you're going to use this in a loop with a `result`, consider using a [Mapper](#mapper) to avoid the name->index lookup on each iteration.
 
 Slice fields can either be mapped to a `pg.Iterator(T)` or a slice. When mapped to a `slice`, an allocator MUST be provided. When mapping to an array of strings (i.e. [][]const u8), the values are duped, and thus both the values and the slice itself must be freed. When mapping to a slice of primitives (i.e. []i32) the slice must be freed. When mapping to an `pg.Iterator(T)` with a custom allocator (`.{.allocator = allocator}`), the iterator must be freed by calling `iteartor.deinit(allocator)`. Whether you're mapping to an `pg.Iterator(T)` or a slice, I Strongly suggest you use an ArenaAllocator.
+
+#### JSON/JSONB
+If a JSON/JSONB column will map to a `field: T` using `std.json.parseFromSliceLeaky`. An `allocator` _must_ be given and the `allocator` _must_ be an arena. For cases where the allocator is not an arena, declare the field as `std.json.Parsed(T)` (which exposes a `value: T` and a `deinit` method)
 
 ## QueryRow
 A `QueryRow` is returned from a call to `conn.row` or `conn.rowOpts` and wraps both a `Result` and a `Row.` It exposes the same methods as `Row` as well as `deinit`, which must be called once the `QueryRow` is no longer needed. This is a rare case where `deinit()` can fail. In most cases, you can simply throw away the error (because failure is extremely rare and, if the connection came from a pool, it should repair itself).

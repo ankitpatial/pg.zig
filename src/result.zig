@@ -148,10 +148,11 @@ pub const Result = struct {
     };
 
     pub fn mapper(self: *Result, comptime T: type, opts: MapperOpts) Mapper(T) {
-        var column_indexes: [std.meta.fields(T).len]?usize = undefined;
+        const fnames = @typeInfo(T).@"struct".field_names;
+        var column_indexes: [fnames.len]?usize = undefined;
 
-        inline for (std.meta.fields(T), 0..) |field, i| {
-            column_indexes[i] = self.columnIndex(field.name);
+        inline for (fnames, 0..) |fname, i| {
+            column_indexes[i] = self.columnIndex(fname);
         }
 
         // if we're given an allocator, use that.
@@ -361,30 +362,40 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             }
 
             return switch (opts.map) {
+                .name => self.toUsingName(T, allocator),
                 .ordinal => self.toUsingOrdinal(T, allocator),
-                .name => return self.toUsingName(T, allocator),
             };
         }
 
         fn toUsingOrdinal(self: *const Self, T: type, allocator: ?Allocator) !T {
             var value: T = undefined;
-            inline for (std.meta.fields(T), 0..) |field, column_index| {
-                @field(value, field.name) = try self.mapColumn(&field, column_index, allocator);
+            const SI = @typeInfo(T).@"struct";
+            inline for (SI.field_names, SI.field_types, SI.field_attrs, 0..) |fname, ftype, fattr, column_index| {
+                @field(value, fname) = try self.mapColumn(.{
+                    .name = fname,
+                    .type = ftype,
+                    .default_value_ptr = fattr.default_value_ptr,
+                }, column_index, allocator);
             }
             return value;
         }
 
         fn toUsingName(self: *const Self, T: type, allocator: ?Allocator) !T {
             var value: T = undefined;
+            const SI = @typeInfo(T).@"struct";
+
             const result = self._result;
-            inline for (std.meta.fields(T)) |field| {
-                const name = field.name;
-                @field(value, name) = try self.mapColumn(&field, result.columnIndex(name), allocator);
+            inline for (SI.field_names, SI.field_types, SI.field_attrs) |fname, ftype, fattr| {
+                @field(value, fname) = try self.mapColumn(.{
+                    .name = fname,
+                    .type = ftype,
+                    .default_value_ptr = fattr.default_value_ptr,
+                }, result.columnIndex(fname), allocator);
             }
             return value;
         }
 
-        fn mapColumn(self: *const Self, comptime field: *const std.builtin.Type.StructField, optional_column_index: ?usize, allocator: ?Allocator) !field.type {
+        fn mapColumn(self: *const Self, comptime field: StructField, optional_column_index: ?usize, allocator: ?Allocator) !field.type {
             const T = field.type;
             const column_index = optional_column_index orelse {
                 if (field.default_value_ptr) |dflt| {
@@ -392,6 +403,11 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
                 }
                 return error.FieldColumnMismatch;
             };
+
+            if (comptime isJsonStruct(T)) {
+                try lib.verifyDecodeType(fail_mode, T, &.{ types.JSON.oid.decimal, types.JSONB.oid.decimal }, self.oids[column_index]);
+                return self.mapJson(T, column_index, allocator orelse return error.AllocatorRequiredForJsonMapping);
+            }
 
             if (comptime isSlice(T)) |S| {
                 const slice = blk: {
@@ -411,6 +427,28 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             const a = allocator orelse return value;
             return mapValue(T, if (comptime fail_mode == .safe) try value else value, a);
         }
+
+        fn mapJson(self: *const Self, comptime T: type, column_index: usize, allocator: Allocator) !T {
+            const value = self.values[column_index];
+            if (@typeInfo(T) == .optional) {
+                if (value.is_null) {
+                    return null;
+                }
+                return try self.mapJson(@typeInfo(T).optional.child, column_index, allocator);
+            }
+
+            try lib.verifyNotNull(fail_mode, T, value.is_null);
+
+            const json = if (self.oids[column_index] == types.JSONB.oid.decimal) types.JSONB.decodeKnown(value.data) else value.data;
+
+            // The input is the row's buffer, which won't outlive the row, so
+            // strings must always be copied.
+            const parse_opts = std.json.ParseOptions{ .allocate = .alloc_always };
+            if (comptime @hasField(T, "value") and T == std.json.Parsed(@FieldType(T, "value"))) {
+                return std.json.parseFromSlice(@FieldType(T, "value"), allocator, json, parse_opts);
+            }
+            return std.json.parseFromSliceLeaky(T, allocator, json, parse_opts);
+        }
     };
 }
 
@@ -425,6 +463,22 @@ fn isSlice(comptime T: type) ?type {
         .optional => |opt| return isSlice(opt.child),
         else => return null,
     }
+}
+
+const StructField = struct {
+    name: [:0]const u8,
+    type: type,
+    default_value_ptr: ?*const anyopaque = null,
+};
+
+// A struct (or optional struct) without its own fromPgzRow, which we'll parse
+// from a JSON or JSONB column.
+fn isJsonStruct(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |opt| isJsonStruct(opt.child),
+        .@"struct" => T != types.Numeric and T != types.Cidr and !@hasDecl(T, "fromPgzRow"),
+        else => false,
+    };
 }
 
 fn mapValue(comptime T: type, value: T, allocator: Allocator) !T {
@@ -450,10 +504,12 @@ fn mapValue(comptime T: type, value: T, allocator: Allocator) !T {
 }
 
 pub fn Mapper(comptime T: type) type {
+    const SI = @typeInfo(T).@"struct";
+    const fnames = SI.field_names;
     return struct {
         result: *Result,
         allocator: ?Allocator,
-        column_indexes: [std.meta.fields(T).len]?usize,
+        column_indexes: [fnames.len]?usize,
 
         const Self = @This();
 
@@ -463,8 +519,12 @@ pub fn Mapper(comptime T: type) type {
             var value: T = undefined;
 
             const allocator = self.allocator;
-            inline for (std.meta.fields(T), self.column_indexes) |field, optional_column_index| {
-                @field(value, field.name) = try row.mapColumn(&field, optional_column_index, allocator);
+            inline for (fnames, SI.field_types, SI.field_attrs, self.column_indexes) |fname, ftype, fattr, optional_column_index| {
+                @field(value, fname) = try row.mapColumn(.{
+                    .name = fname,
+                    .type = ftype,
+                    .default_value_ptr = fattr.default_value_ptr,
+                }, optional_column_index, allocator);
             }
             return value;
         }
@@ -558,7 +618,7 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
         }
 
         // used internally by row.get(Iterator(T))
-        fn fromPgzRow(value: Result.State.Value, oid: i32) !Self {
+        pub fn fromPgzRow(value: Result.State.Value, oid: i32) !Self {
             const data = value.data;
             const TT = switch (@typeInfo(T)) {
                 .optional => |opt| opt.child,
@@ -587,11 +647,15 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
                     };
                     break :blk &types.Int32.decodeKnown;
                 },
-                i64 => switch (oid) {
-                    types.TimestampArray.oid.decimal => &types.Timestamp.decodeKnown,
-                    types.TimestampTzArray.oid.decimal => &types.Timestamp.decodeKnown,
-                    types.Int64Array.oid.decimal => &types.Int64.decodeKnown,
-                    else => std.debug.panic("{d} oid cannot target i64 iterator", .{oid}),
+                i64 => blk: {
+                    lib.verifyDecodeType(fail_mode, []i64, &.{ types.Int64Array.oid.decimal, types.TimestampArray.oid.decimal, types.TimestampTzArray.oid.decimal }, oid) catch |err| {
+                        if (comptime fail_mode == .unsafe) unreachable;
+                        return err;
+                    };
+                    break :blk switch (oid) {
+                        types.TimestampArray.oid.decimal, types.TimestampTzArray.oid.decimal => &types.Timestamp.decodeKnown,
+                        else => &types.Int64.decodeKnown,
+                    };
                 },
                 f32 => blk: {
                     lib.verifyDecodeType(fail_mode, []f32, &.{types.Float32Array.oid.decimal}, oid) catch |err| {
@@ -600,10 +664,15 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
                     };
                     break :blk &types.Float32.decodeKnown;
                 },
-                f64 => switch (oid) {
-                    types.Float64Array.oid.decimal => &types.Float64.decodeKnown,
-                    types.NumericArray.oid.decimal => &types.Numeric.decodeKnownToFloat,
-                    else => std.debug.panic("{d} oid cannot target f64 iterator", .{oid}),
+                f64 => blk: {
+                    lib.verifyDecodeType(fail_mode, []f64, &.{ types.Float64Array.oid.decimal, types.NumericArray.oid.decimal }, oid) catch |err| {
+                        if (comptime fail_mode == .unsafe) unreachable;
+                        return err;
+                    };
+                    break :blk switch (oid) {
+                        types.NumericArray.oid.decimal => &types.Numeric.decodeKnownToFloat,
+                        else => &types.Float64.decodeKnown,
+                    };
                 },
                 bool => blk: {
                     lib.verifyDecodeType(fail_mode, []bool, &.{types.BoolArray.oid.decimal}, oid) catch |err| {
@@ -660,14 +729,29 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
             // minimum size for 1 empty array
             lib.assert(data.len >= 20);
             const dimensions = std.mem.readInt(i32, data[0..4], .big);
-            lib.assert(dimensions == 1);
-
             const has_nulls = std.mem.readInt(i32, data[4..8][0..4], .big);
-            lib.assert(has_nulls == 0 or @typeInfo(T) == .optional);
+
+            // The column's type says nothing about either: an int4[] holds
+            // arrays of any number of dimensions, and any array may hold a
+            // NULL. That is the data being wrong for T, not the program.
+            if (comptime fail_mode == .safe) {
+                if (dimensions != 1) return error.InvalidType;
+                if (has_nulls != 0 and @typeInfo(T) != .optional) return error.UnexpectedNull;
+            } else {
+                lib.assert(dimensions == 1);
+                lib.assert(has_nulls == 0 or @typeInfo(T) == .optional);
+            }
 
             // const oid = std.mem.readInt(i32, data[8..12][0..4], .big);
             const l = std.mem.readInt(i32, data[12..16][0..4], .big);
             // const lower_bound = std.mem.readInt(i32, data[16..20][0..4], .big);
+
+            // next() cannot fail, so a label the enum does not have has to be
+            // found here, by one pass over the elements. Only enum arrays in
+            // the safe mode pay for it.
+            if (comptime fail_mode == .safe and @typeInfo(TT) == .@"enum") {
+                try checkEnumLabels(TT, data[20..], @intCast(l));
+            }
 
             return .{
                 .is_null = false,
@@ -704,6 +788,11 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
             // TODO: for fixed length types, we don't need to decode the length
             const len_end = pos + 4;
             const value_len = std.mem.readInt(i32, data[pos..len_end][0..4], .big);
+
+            if ((comptime @typeInfo(T) == .optional) and value_len == -1) {
+                self._pos = len_end;
+                return @as(T, null);
+            }
 
             const data_end = len_end + @as(usize, @intCast(value_len));
             lib.assert(data.len >= data_end);
@@ -747,6 +836,22 @@ pub fn IteratorT(comptime fail_mode: lib.FailMode, comptime T: type) type {
             }
         }
     };
+}
+
+fn checkEnumLabels(comptime E: type, items: []const u8, count: usize) lib.TypeError!void {
+    var pos: usize = 0;
+    for (0..count) |_| {
+        const len_end = pos + 4;
+        const item_len = std.mem.readInt(i32, items[pos..len_end][0..4], .big);
+        if (item_len == -1) {
+            pos = len_end;
+            continue;
+        }
+        pos = len_end + @as(usize, @intCast(item_len));
+        if (std.meta.stringToEnum(E, items[len_end..pos]) == null) {
+            return error.InvalidType;
+        }
+    }
 }
 
 fn EnumDecoder(comptime T: type) type {
@@ -910,6 +1015,50 @@ test "Result: floats" {
         try t.expectEqual(null, row.get(?f64, 1));
         try t.expectEqual(null, result.next());
     }
+}
+
+test "Result: timestamp infinity" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    var result = try c.query(
+        \\ select 'infinity'::timestamptz, '-infinity'::timestamptz,
+        \\        'infinity'::timestamp, '-infinity'::timestamp,
+        \\        '2000-01-01 00:00:00+00'::timestamptz,
+        \\        array['infinity'::timestamptz, '-infinity', '2000-01-01 00:00:01+00']
+    , .{});
+    defer result.deinit();
+    defer result.drain() catch unreachable;
+
+    const row = (try result.next()).?;
+    try t.expectEqual(std.math.maxInt(i64), try row.get(i64, 0));
+    try t.expectEqual(std.math.minInt(i64), try row.get(i64, 1));
+    try t.expectEqual(std.math.maxInt(i64), try row.get(i64, 2));
+    try t.expectEqual(std.math.minInt(i64), try row.get(i64, 3));
+    try t.expectEqual(946_684_800_000_000, try row.get(i64, 4));
+
+    var it = try row.iterator(i64, 5);
+    try t.expectEqual(std.math.maxInt(i64), it.next());
+    try t.expectEqual(std.math.minInt(i64), it.next());
+    try t.expectEqual(946_684_801_000_000, it.next());
+    try t.expectEqual(null, it.next());
+}
+
+test "Result: timestamp infinity round trip" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    var result = try c.query(
+        "select $1::timestamptz::text, $2::timestamptz::text, $3::timestamptz[]::text",
+        .{ std.math.maxInt(i64), std.math.minInt(i64), [_]i64{ std.math.maxInt(i64), std.math.minInt(i64), 946_684_801_000_000 } },
+    );
+    defer result.deinit();
+    defer result.drain() catch unreachable;
+
+    const row = (try result.next()).?;
+    try t.expectString("infinity", try row.get([]u8, 0));
+    try t.expectString("-infinity", try row.get([]u8, 1));
+    try t.expectString("{infinity,-infinity,\"2000-01-01 00:00:01+00\"}", try row.get([]u8, 2));
 }
 
 test "Result: bool" {
@@ -1196,6 +1345,40 @@ test "Result: int[]" {
     try t.expectSlice(i64, &.{ 944949338498392, -2 }, v3);
 }
 
+test "Result: iterator of the wrong type is an error" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    {
+        var result = try c.query("select array[1, 2]::int4[], array['a', 'b']::text[]", .{});
+        defer result.deinit();
+        defer result.drain() catch unreachable;
+
+        const row = (try result.next()).?;
+        try t.expectError(error.InvalidType, row.iterator(i64, 0));
+        try t.expectError(error.InvalidType, row.iterator(f64, 0));
+        try t.expectError(error.InvalidType, row.iterator(i64, 1));
+        try t.expectError(error.InvalidType, row.iterator(f64, 1));
+    }
+
+    {
+        // the types that are accepted are still accepted
+        var result = try c.query("select array[1]::int8[], array[1.5]::float8[], array[2.5]::numeric[], array['2000-01-01']::timestamptz[]", .{});
+        defer result.deinit();
+        defer result.drain() catch unreachable;
+
+        const row = (try result.next()).?;
+        var ints = try row.iterator(i64, 0);
+        try t.expectEqual(1, ints.next());
+        var floats = try row.iterator(f64, 1);
+        try t.expectEqual(1.5, floats.next());
+        var numerics = try row.iterator(f64, 2);
+        try t.expectEqual(2.5, numerics.next());
+        var timestamps = try row.iterator(i64, 3);
+        try t.expectEqual(946_684_800_000_000, timestamps.next());
+    }
+}
+
 test "Result: float[]" {
     var c = try t.connect(.{});
     defer c.deinit();
@@ -1213,6 +1396,43 @@ test "Result: float[]" {
     const v2 = try row.iterator(f64, 1).alloc(t.allocator);
     defer t.allocator.free(v2);
     try t.expectSlice(f64, &.{ -888585.123322, 0.001 }, v2);
+}
+
+test "Result: iterator over an array it cannot read" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    {
+        // PostgreSQL stores a two dimensional array in an int4[] column
+        var result = try c.query("select array[[1, 2], [3, 4]]::int4[]", .{});
+        defer result.deinit();
+        defer result.drain() catch unreachable;
+
+        const row = (try result.next()).?;
+        try t.expectError(error.InvalidType, row.iterator(i32, 0));
+    }
+
+    {
+        // and any array may hold a NULL
+        var result = try c.query("select array[1, null, 3]::int4[]", .{});
+        defer result.deinit();
+        defer result.drain() catch unreachable;
+
+        const row = (try result.next()).?;
+        try t.expectError(error.UnexpectedNull, row.iterator(i32, 0));
+
+        // which an optional element type reads, by next() and by alloc()
+        var it = try row.iterator(?i32, 0);
+        try t.expectEqual(1, it.next());
+        const null_element: ?i32 = null;
+        try t.expectEqual(null_element, it.next());
+        try t.expectEqual(3, it.next());
+        try t.expectEqual(null, it.next());
+
+        const all = try (try row.iterator(?i32, 0)).alloc(t.allocator);
+        defer t.allocator.free(all);
+        try t.expectSlice(?i32, &.{ 1, null, 3 }, all);
+    }
 }
 
 test "Result: bool[]" {
@@ -1295,6 +1515,36 @@ test "Result: text[] alloc dupes" {
 
     try t.expectStringSlice(&.{ "Leto", "Test" }, arr1);
     try t.expectStringSlice(&.{ "Ghanima", "Goku" }, arr2);
+}
+
+test "Result: an enum label the enum does not have is an error" {
+    const Mood = enum { sad, ok };
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    {
+        var result = try c.query("select 'meh'::text, 'ok'::text", .{});
+        defer result.deinit();
+        defer result.drain() catch unreachable;
+
+        const row = (try result.next()).?;
+        try t.expectError(error.InvalidType, row.get(Mood, 0));
+        try t.expectEqual(Mood.ok, try row.get(Mood, 1));
+    }
+
+    {
+        var result = try c.query("select array['sad', 'meh']::text[], array['sad', null, 'ok']::text[]", .{});
+        defer result.deinit();
+        defer result.drain() catch unreachable;
+
+        const row = (try result.next()).?;
+        try t.expectError(error.InvalidType, row.iterator(Mood, 0));
+
+        // a NULL element is not a label, and is not checked as one
+        const all = try (try row.iterator(?Mood, 1)).alloc(t.allocator);
+        defer t.allocator.free(all);
+        try t.expectSlice(?Mood, &.{ .sad, null, .ok }, all);
+    }
 }
 
 test "Result: UUID" {
@@ -1582,6 +1832,92 @@ test "Row.to: name no map" {
         try t.expectEqual(false, user.active);
         try t.expectString("ghanima", user.name);
         try t.expectString("n1", user.note.?);
+    }
+}
+
+test "Row.to: json" {
+    const Stats = struct { power: u32, name: []const u8 };
+
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    {
+        // json and jsonb, leaky
+        const User = struct {
+            id: i32,
+            a: Stats,
+            b: Stats,
+        };
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+
+        var row = (try c.rowOpts("select 3 as id, '{\"power\": 9001, \"name\": \"goku\"}'::json as a, '{\"power\": 8000, \"name\": \"vegeta\"}'::jsonb as b", .{}, .{ .column_names = true })).?;
+        defer row.deinit() catch {};
+
+        const user = try row.to(User, .{ .map = .name, .allocator = arena.allocator() });
+        try t.expectEqual(3, user.id);
+        try t.expectEqual(9001, user.a.power);
+        try t.expectString("goku", user.a.name);
+        try t.expectEqual(8000, user.b.power);
+        try t.expectString("vegeta", user.b.name);
+    }
+
+    {
+        // json.Parsed
+        const User = struct {
+            a: std.json.Parsed(Stats),
+            b: std.json.Parsed(Stats),
+        };
+
+        var row = (try c.row("select '{\"power\": 1, \"name\": \"krillin\"}'::json, '{\"power\": 2, \"name\": \"yamcha\"}'::jsonb", .{})).?;
+        defer row.deinit() catch {};
+
+        const user = try row.to(User, .{ .allocator = t.allocator });
+        defer user.a.deinit();
+        defer user.b.deinit();
+        try t.expectEqual(1, user.a.value.power);
+        try t.expectString("krillin", user.a.value.name);
+        try t.expectEqual(2, user.b.value.power);
+        try t.expectString("yamcha", user.b.value.name);
+    }
+
+    {
+        // optionals
+        const User = struct {
+            a: ?Stats,
+            b: ?std.json.Parsed(Stats),
+            c: ?Stats,
+            d: ?std.json.Parsed(Stats),
+        };
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+
+        var row = (try c.row("select null::json, null::jsonb, '{\"power\": 3, \"name\": \"gohan\"}'::jsonb, '{\"power\": 4, \"name\": \"piccolo\"}'::json", .{})).?;
+        defer row.deinit() catch {};
+
+        const user = try row.to(User, .{ .allocator = arena.allocator() });
+        try t.expectEqual(null, user.a);
+        try t.expectEqual(null, user.b);
+        try t.expectEqual(3, user.c.?.power);
+        try t.expectString("gohan", user.c.?.name);
+        try t.expectEqual(4, user.d.?.value.power);
+        try t.expectString("piccolo", user.d.?.value.name);
+    }
+
+    {
+        // allocator required
+        const User = struct { a: Stats };
+        var row = (try c.row("select '{\"power\": 1, \"name\": \"x\"}'::json", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectError(error.AllocatorRequiredForJsonMapping, row.to(User, .{}));
+    }
+
+    {
+        // null into non-optional
+        const User = struct { a: Stats };
+        var row = (try c.row("select null::json", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectError(error.UnexpectedNull, row.to(User, .{ .allocator = t.allocator }));
     }
 }
 

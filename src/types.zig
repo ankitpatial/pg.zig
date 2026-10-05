@@ -149,10 +149,27 @@ pub const Timestamp = struct {
     const encoding = &binary_encoding;
     const us_from_epoch_to_y2k = 946_684_800_000_000;
 
+    // PostgreSQL sends 'infinity' and '-infinity' as the extremes of an i64.
+    // They are not offsets from the epoch: shifting them overflows, or turns
+    // -infinity into a date that is not infinite. They stay what they are.
+    const infinity = std.math.maxInt(i64);
+    const negative_infinity = std.math.minInt(i64);
+
+    // microseconds since 2000-01-01 (PostgreSQL's epoch) to since 1970-01-01
+    fn fromPg(pg: i64) i64 {
+        if (pg == infinity or pg == negative_infinity) return pg;
+        return pg +| us_from_epoch_to_y2k;
+    }
+
+    fn toPg(value: i64) i64 {
+        if (value == infinity or value == negative_infinity) return value;
+        return value -| us_from_epoch_to_y2k;
+    }
+
     fn encode(value: i64, buf: *buffer.Buffer, format_pos: usize) !void {
         buf.writeAt(Timestamp.encoding, format_pos);
         try buf.write(&.{ 0, 0, 0, 8 }); // length of our data
-        return buf.writeIntBig(i64, value - us_from_epoch_to_y2k);
+        return buf.writeIntBig(i64, toPg(value));
     }
 
     pub fn decode(comptime fail_mode: lib.FailMode, data: []const u8, data_oid: i32) if (fail_mode == .unsafe) i64 else lib.TypeError!i64 {
@@ -160,11 +177,11 @@ pub const Timestamp = struct {
             if (comptime fail_mode == .unsafe) unreachable;
             return err;
         };
-        return std.mem.readInt(i64, data[0..8], .big) + us_from_epoch_to_y2k;
+        return fromPg(std.mem.readInt(i64, data[0..8], .big));
     }
 
     pub fn decodeKnown(data: []const u8) i64 {
-        return std.mem.readInt(i64, data[0..8], .big) + us_from_epoch_to_y2k;
+        return fromPg(std.mem.readInt(i64, data[0..8], .big));
     }
 };
 
@@ -581,8 +598,6 @@ pub const TimestampTzArray = struct {
 };
 
 fn writeTimestampArray(values: anytype, buf: *buffer.Buffer) !void {
-    const us_from_epoch_to_y2k = 946_684_800_000_000;
-
     // at most, every value is 12 bytes, 4 byte length + 8 byte value
     var view = try buf.skip(12 * values.len);
 
@@ -599,7 +614,7 @@ fn writeTimestampArray(values: anytype, buf: *buffer.Buffer) !void {
             };
         } else v = value;
         view.write(&.{ 0, 0, 0, 8 }); // length of value
-        view.writeIntBig(i64, v - us_from_epoch_to_y2k);
+        view.writeIntBig(i64, Timestamp.toPg(v));
     }
 
     if (comptime nullables) {
@@ -923,8 +938,8 @@ pub const CharArray = struct {
 
 // Return the encoding we want PG to use for a particular OID
 fn resultEncodingFor(oid: i32) *const [2]u8 {
-    inline for (@typeInfo(@This()).@"struct".decls) |decl| {
-        const S = @field(@This(), decl.name);
+    inline for (@typeInfo(@This()).@"struct".decl_names) |decl| {
+        const S = @field(@This(), decl);
         if (@typeInfo(@TypeOf(S)) == .type and @hasField(S, "oid")) {
             if (oid == S.oid.decimal) {
                 return S.encoding;
@@ -1366,11 +1381,7 @@ pub fn bindValue(comptime T: type, oid: i32, value: anytype, buf: *buffer.Buffer
         },
         .pointer => |ptr| switch (ptr.size) {
             .slice => {
-                if (ptr.is_const) {
-                    return bindSlice(oid, @as([]const ptr.child, value), buf, format_pos);
-                } else {
-                    return bindSlice(oid, @as([]ptr.child, value), buf, format_pos);
-                }
+                return bindSlice(oid, @as([]const ptr.child, value), buf, format_pos);
             },
             .one => switch (@typeInfo(ptr.child)) {
                 .array => {
@@ -1587,6 +1598,9 @@ pub fn decodeScalar(comptime fail_mode: lib.FailMode, comptime T: type, data: []
         else => switch (@typeInfo(T)) {
             .@"enum" => {
                 const str = Bytea.decode(data, oid);
+                if (comptime fail_mode == .safe) {
+                    return std.meta.stringToEnum(T, str) orelse error.InvalidType;
+                }
                 return std.meta.stringToEnum(T, str).?;
             },
             else => @compileError("cannot decode value of type " ++ @typeName(T)),
