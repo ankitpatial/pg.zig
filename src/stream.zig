@@ -287,11 +287,16 @@ const PlainStream = struct {
                     return error.UnixPathNotSupported;
                 }
                 const addr: Io.net.UnixAddress = try .init(host);
-                break :blk addr.connect(io);
+                // POSIX: dial, as std's blocking connect panics if a signal interrupts it.
+                if (comptime builtin.os.tag == .windows) break :blk addr.connect(io);
+                break :blk dial.unix(io, addr.path);
             }
             const port = opts.port orelse lib.default_port;
-            const hostname: Io.net.HostName = try .init(host);
-            break :blk hostname.connect(io, port, .{ .mode = .stream });
+            if (comptime builtin.os.tag == .windows) {
+                const hostname: Io.net.HostName = try .init(host);
+                break :blk hostname.connect(io, port, .{ .mode = .stream });
+            }
+            break :blk dial.tcp(io, host, port);
         };
         errdefer stream.close(io);
 
@@ -466,3 +471,4 @@ fn isHostName(host: []const u8) bool {
 }
 
 const windows = @import("windows.zig");
+const dial = @import("dial.zig");
