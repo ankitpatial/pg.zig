@@ -127,6 +127,25 @@ pub const Conn = struct {
         timeout: u32 = 10_000,
         application_name: ?[]const u8 = null,
         startup_parameters: ?std.hash_map.StringHashMap([]const u8) = null,
+
+        // The authentication methods we'll go along with. The server picks
+        // the method, so without TLS certificate verification (tls = .verify_full)
+        // a man-in-the-middle can ask for the password in cleartext.
+        auth_methods: AuthMethods = .{},
+
+        // A server can make us spend as long as it likes in PBKDF2 by asking
+        // for a huge number of SCRAM iterations. PostgreSQL defaults to 4096.
+        max_scram_iterations: u32 = 1_000_000,
+    };
+
+    pub const AuthMethods = struct {
+        // the server let us in without asking for a password (e.g. trust)
+        none: bool = true,
+        password: bool = true,
+        md5: bool = true,
+        scram_sha_256: bool = true,
+
+        pub const scram_only: AuthMethods = .{ .none = false, .password = false, .md5 = false };
     };
 
     pub const QueryOpts = struct {
@@ -178,7 +197,7 @@ pub const Conn = struct {
         const buf = try Buffer.init(allocator, @max(opts.write_buffer orelse 2048, 128));
         errdefer buf.deinit();
 
-        const reader = try Reader.init(allocator, opts.read_buffer orelse 4096, stream);
+        const reader = try Reader.init(allocator, opts.read_buffer orelse 8192, stream);
         errdefer reader.deinit();
 
         const result_state = try Result.State.init(allocator, opts.result_state_size);
@@ -267,6 +286,139 @@ pub const Conn = struct {
         return stmt;
     }
 
+    pub const Column = struct {
+        name: []const u8,
+
+        // The OID of the type of this column
+        oid: i32,
+
+        // The OID of the table this column comes from. 0 when the column is not a reference to a table column
+        table_oid: i32,
+
+        // The 1-based attribute number of this column within table_oid. 0 when table_oid is 0.
+        column_number: i16,
+    };
+
+    pub const QueryDescription = struct {
+        arena: ArenaAllocator,
+
+        param_oids: []i32,
+
+        // Empty when the statement does not return any rows
+        columns: []Column,
+
+        pub fn deinit(self: *QueryDescription) void {
+            self.arena.deinit();
+        }
+    };
+
+    pub fn describe(self: *Conn, allocator: Allocator, sql: []const u8) !QueryDescription {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+
+        try self._reader.startFlow(null, null);
+        defer {
+            self._reader.endFlow() catch {
+                // this can only fail in extreme conditions (OOM) and it will only impact
+                // the next query (and if the app is using the pool, the pool will try to
+                // recover from this anyways)
+                self._state = .fail;
+            };
+        }
+        var arena_state: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var param_oids: []i32 = &.{};
+        var columns: []Column = &.{};
+
+        {
+            const total_length = 21 + sql.len;
+            var buf = &self._buf;
+            buf.reset();
+            try buf.ensureTotalCapacity(total_length);
+
+            var view = buf.skip(total_length) catch unreachable;
+
+            // PARSE
+            view.writeByte('P');
+            view.writeIntBig(u32, @intCast(8 + sql.len));
+            view.writeByte(0);
+            view.write(sql);
+            view.write(&.{ 0, 0, 0 });
+
+            // DESCRIBE
+            view.write(&.{ 'D', 0, 0, 0, 6, 'S', 0 });
+
+            // SYNC
+            view.write(&.{ 'S', 0, 0, 0, 4 });
+
+            self._state = .query;
+            try self.write(buf.string());
+        }
+
+        {
+            const msg = self.read() catch |err| {
+                self.readyForQuery() catch {};
+                return err;
+            };
+            if (msg.type != '1') {
+                return self.unexpectedDBMessage();
+            }
+        }
+
+        {
+            const msg = try self.read();
+            if (msg.type != 't') {
+                return self.unexpectedDBMessage();
+            }
+            const data = msg.data;
+            const param_count = std.mem.readInt(u16, data[0..2], .big);
+
+            param_oids = try arena.alloc(i32, param_count);
+            for (0..param_count) |i| {
+                param_oids[i] = std.mem.readInt(i32, data[2 + i * 4 ..][0..4], .big);
+            }
+        }
+
+        {
+            const msg = try self.read();
+            switch (msg.type) {
+                // n means the statement does not return any rows
+                'n' => {},
+                'T' => {
+                    const data = msg.data;
+                    const column_count = std.mem.readInt(u16, data[0..2], .big);
+                    columns = try arena.alloc(Column, column_count);
+                    var pos: usize = 2;
+                    for (0..column_count) |i| {
+                        const end_pos = std.mem.indexOfScalarPos(u8, data, pos, 0) orelse return error.InvalidDataRow;
+                        if (data.len < (end_pos + 19)) {
+                            return error.InvalidDataRow;
+                        }
+                        columns[i] = .{
+                            .name = try arena.dupe(u8, data[pos..end_pos]),
+                            .table_oid = std.mem.readInt(i32, data[end_pos + 1 ..][0..4], .big),
+                            .column_number = std.mem.readInt(i16, data[end_pos + 5 ..][0..2], .big),
+                            .oid = std.mem.readInt(i32, data[end_pos + 7 ..][0..4], .big),
+                        };
+                        pos = end_pos + 19;
+                    }
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
+
+        try self.readyForQuery();
+
+        return .{
+            .arena = arena_state,
+            .param_oids = param_oids,
+            .columns = columns,
+        };
+    }
+
     pub fn query(self: *Conn, sql: []const u8, values: anytype) !*Result {
         return self.queryOpts(sql, values, .{});
     }
@@ -320,14 +472,14 @@ pub const Conn = struct {
         const name = opts.cache_name;
 
         if (name) |n| {
-            if (self._prepared_statements.getPtr(n)) |describe| {
+            if (self._prepared_statements.getPtr(n)) |cached_desc| {
                 cached = true;
-                stmt = try Stmt.fromDescribe(self, describe, opts);
+                stmt = try Stmt.fromDescribe(self, cached_desc, opts);
                 errdefer stmt.deinit();
 
                 try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
                 stmt.buf.reset();
-                try stmt.prepareForBind(@intCast(describe.param_oids.len));
+                try stmt.prepareForBind(@intCast(cached_desc.param_oids.len));
             }
         }
 
@@ -832,6 +984,27 @@ test "Conn: auth scram-sha-256 password" {
     }
 }
 
+test "Conn: auth scram_only" {
+    {
+        var conn = try Conn.open(t.io, t.allocator, .{});
+        defer conn.deinit();
+        try conn.auth(.{ .username = "pgz_user_scram_sha256", .password = "pgz_user_scram_sha256_pw", .database = "postgres", .auth_methods = .scram_only });
+    }
+
+    {
+        var conn = try Conn.open(t.io, t.allocator, .{});
+        defer conn.deinit();
+        try t.expectError(error.AuthMethodNotAllowed, conn.auth(.{ .username = "pgz_user_clear", .password = "pgz_user_clear_pw", .database = "postgres", .auth_methods = .scram_only }));
+    }
+
+    {
+        // a server asking for more iterations than we allow
+        var conn = try Conn.open(t.io, t.allocator, .{});
+        defer conn.deinit();
+        try t.expectError(error.TooManySCRAMIterations, conn.auth(.{ .username = "pgz_user_scram_sha256", .password = "pgz_user_scram_sha256_pw", .database = "postgres", .max_scram_iterations = 100 }));
+    }
+}
+
 test "Conn: exec rowsAffected" {
     var c = try t.connect(.{});
     defer c.deinit();
@@ -886,6 +1059,80 @@ test "Conn: parse error" {
     try t.expectString("syntax error at or near \"selct\"", err.message);
 
     // connection is still usable
+    try t.expectEqual(2, t.scalar(&c, "select 2"));
+}
+
+test "Conn: describe" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    const table_oid = t.scalar(&c, "select 'all_types'::regclass::int4");
+    const col_text_att = t.scalar(&c,
+        \\select attnum::int4 from pg_attribute
+        \\where attrelid = 'all_types'::regclass and attname = 'col_text'
+    );
+
+    {
+        var d = try c.describe(t.allocator, "select id, col_text, 'n/a' as not_a_column from all_types where id = $1 and col_int2 = $2");
+        defer d.deinit();
+
+        try t.expectEqual(2, d.param_oids.len);
+        try t.expectEqual(23, d.param_oids[0]);
+        try t.expectEqual(21, d.param_oids[1]);
+
+        try t.expectEqual(3, d.columns.len);
+
+        try t.expectString("id", d.columns[0].name);
+        try t.expectEqual(23, d.columns[0].oid);
+        try t.expectEqual(table_oid, d.columns[0].table_oid);
+        try t.expectEqual(1, d.columns[0].column_number);
+
+        try t.expectString("col_text", d.columns[1].name);
+        try t.expectEqual(25, d.columns[1].oid);
+        try t.expectEqual(table_oid, d.columns[1].table_oid);
+        try t.expectEqual(col_text_att, @as(i32, d.columns[1].column_number));
+
+        // expressions don't belong to any table
+        try t.expectString("not_a_column", d.columns[2].name);
+        try t.expectEqual(25, d.columns[2].oid);
+        try t.expectEqual(0, d.columns[2].table_oid);
+        try t.expectEqual(0, d.columns[2].column_number);
+    }
+
+    {
+        var d = try c.describe(t.allocator, "select $1::int2, $2 from simple_table");
+        defer d.deinit();
+
+        try t.expectEqual(2, d.param_oids.len);
+        try t.expectEqual(21, d.param_oids[0]); // int2
+        try t.expectEqual(25, d.param_oids[1]);
+
+        try t.expectEqual(2, d.columns.len);
+        try t.expectString("int2", d.columns[0].name);
+    }
+
+    {
+        var d = try c.describe(t.allocator, "insert into simple_table (value) values ('test describe')");
+        defer d.deinit();
+
+        try t.expectEqual(0, d.param_oids.len);
+        try t.expectEqual(0, d.columns.len);
+    }
+
+    // the connection is unaffected
+    try t.expectEqual(1, t.scalar(&c, "select 1"));
+}
+
+test "Conn: describe error" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    try t.expectError(error.PG, c.describe(t.allocator, "selct 1 as a, b as from"));
+
+    const err = c.err.?;
+    try t.expectString("42601", err.code);
+    try std.testing.expect(std.mem.indexOf(u8, err.message, "syntax error") != null);
+
+    // we want the error drained and conn usable
     try t.expectEqual(2, t.scalar(&c, "select 2"));
 }
 
@@ -1778,6 +2025,169 @@ test "PG: char" {
     try t.expectSlice(u8, &.{ ',', '"' }, try row.iterator(u8, 1).alloc(aa));
     try t.expectSlice(u8, &.{ '\\', 'a', ' ' }, try row.iterator(u8, 2).alloc(aa));
     try t.expectSlice(u8, &.{ 'z', '@' }, try row.iterator(u8, 3).alloc(aa));
+}
+
+test "Conn: invalid DataRow from the server" {
+    const bad_rows = [_][]const u8{
+        // 2 columns, but RowDescription said 1
+        &.{ 'D', 0, 0, 0, 14, 0, 2, 0, 0, 0, 1, 7, 0, 0, 0, 1, 8 },
+        // a value longer than the message
+        &.{ 'D', 0, 0, 0, 11, 0, 1, 0, 0, 0, 100, 7 },
+        // a negative length that isn't -1 (null)
+        &.{ 'D', 0, 0, 0, 10, 0, 1, 0xff, 0xff, 0xff, 0xfb },
+        // no room for the value's length
+        &.{ 'D', 0, 0, 0, 8, 0, 1, 0, 0 },
+        // no column count
+        &.{ 'D', 0, 0, 0, 4 },
+    };
+
+    for (bad_rows) |bad_row| {
+        var server = try FakeServer.start(&.{ &FakeServer.auth_ok, &FakeServer.ready_for_query, &FakeServer.describe_one_int, bad_row });
+        {
+            var c = try Conn.open(t.io, t.allocator, .{ .host = "127.0.0.1", .port = server.port() });
+            defer c.deinit();
+            try c.auth(.{});
+
+            var result = try c.query("select a", .{});
+            defer result.deinit();
+            try t.expectError(error.InvalidDataRow, result.next());
+            try t.expectEqual(Conn.State.fail, c._state);
+        }
+        _ = try server.stop();
+    }
+}
+
+test "Conn: auth_methods" {
+    const cleartext = [_]u8{ 'R', 0, 0, 0, 8, 0, 0, 0, 3 };
+    const md5 = [_]u8{ 'R', 0, 0, 0, 12, 0, 0, 0, 5, 1, 2, 3, 4 };
+    const sasl = [_]u8{ 'R', 0, 0, 0, 23, 0, 0, 0, 10 } ++ "SCRAM-SHA-256".* ++ [_]u8{ 0, 0 };
+
+    const Case = struct {
+        request: []const u8,
+        methods: Conn.AuthMethods,
+        allowed: bool,
+    };
+    const cases = [_]Case{
+        .{ .request = &cleartext, .methods = .{}, .allowed = true },
+        .{ .request = &cleartext, .methods = .scram_only, .allowed = false },
+        .{ .request = &md5, .methods = .{}, .allowed = true },
+        .{ .request = &md5, .methods = .{ .md5 = false }, .allowed = false },
+        .{ .request = &FakeServer.auth_ok, .methods = .{}, .allowed = true },
+        .{ .request = &FakeServer.auth_ok, .methods = .scram_only, .allowed = false },
+        .{ .request = &sasl, .methods = .{ .scram_sha_256 = false }, .allowed = false },
+    };
+
+    for (cases) |case| {
+        // a server that doesn't ask for a password has already said ok
+        const asks = case.request.ptr != &FakeServer.auth_ok;
+        const messages: []const []const u8 = if (asks)
+            &.{ case.request, &FakeServer.auth_ok, &FakeServer.ready_for_query }
+        else
+            &.{ case.request, &FakeServer.ready_for_query };
+        var server = try FakeServer.start(messages);
+        {
+            var c = try Conn.open(t.io, t.allocator, .{ .host = "127.0.0.1", .port = server.port() });
+            defer c.deinit();
+            const result = c.auth(.{ .password = "the-password", .auth_methods = case.methods });
+            if (case.allowed) {
+                try result;
+            } else {
+                try t.expectError(error.AuthMethodNotAllowed, result);
+            }
+        }
+
+        const received = try server.stop();
+        if (case.request.ptr == &cleartext) {
+            // proves we'd see the password if it had been sent
+            try t.expectEqual(case.allowed, received.contains("the-password"));
+        }
+        if (!case.allowed) {
+            // nothing after the startup message, except the Terminate from deinit
+            const startup_len = std.mem.readInt(u32, received.buf[0..4], .big);
+            try t.expectSlice(u8, &.{ 'X', 0, 0, 0, 4 }, received.buf[startup_len..received.len]);
+        }
+    }
+}
+
+// Accepts one connection and plays back `messages`, written up front without
+// reading anything: the client reads the replies in order. It records what
+// the client sent, which stop() returns.
+const FakeServer = struct {
+    listener: Io.net.Server,
+    future: Io.Future(anyerror!Received),
+
+    const Received = struct {
+        buf: [4096]u8 = undefined,
+        len: usize = 0,
+
+        fn contains(self: *const Received, needle: []const u8) bool {
+            return std.mem.find(u8, self.buf[0..self.len], needle) != null;
+        }
+    };
+
+    const auth_ok = [_]u8{ 'R', 0, 0, 0, 8, 0, 0, 0, 0 };
+    const ready_for_query = [_]u8{ 'Z', 0, 0, 0, 5, 'I' };
+
+    // describes a query with no parameters and one int4 column, "a", ready
+    // for its first DataRow
+    const describe_one_int = [_]u8{ '1', 0, 0, 0, 4 } // ParseComplete
+        ++ [_]u8{ 't', 0, 0, 0, 6, 0, 0 } // ParameterDescription
+        ++ [_]u8{ 'T', 0, 0, 0, 26, 0, 1, 'a', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0, 4, 0xff, 0xff, 0xff, 0xff, 0, 1 } // RowDescription
+        ++ ready_for_query ++ [_]u8{ '2', 0, 0, 0, 4 }; // BindComplete
+
+    fn start(messages: []const []const u8) !FakeServer {
+        const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        var listener = try addr.listen(t.io, .{});
+        errdefer listener.deinit(t.io);
+        return .{
+            .listener = listener,
+            .future = try t.io.concurrent(serve, .{ listener, messages }),
+        };
+    }
+
+    fn port(self: *const FakeServer) u16 {
+        return self.listener.socket.address.ip4.port;
+    }
+
+    // call after the client has closed its connection
+    fn stop(self: *FakeServer) !Received {
+        defer self.listener.deinit(t.io);
+        return self.future.await(t.io);
+    }
+
+    fn serve(listener_: Io.net.Server, messages: []const []const u8) anyerror!Received {
+        var listener = listener_;
+        const stream = try listener.accept(t.io);
+        defer stream.close(t.io);
+
+        var buf: [256]u8 = undefined;
+        var writer = stream.writer(t.io, &buf);
+        for (messages) |m| {
+            try writer.interface.writeAll(m);
+        }
+        try writer.interface.flush();
+
+        // everything until the client hangs up
+        var received: Received = .{};
+        var read_buf: [256]u8 = undefined;
+        var reader = stream.reader(t.io, &read_buf);
+        received.len = try reader.interface.readSliceShort(&received.buf);
+        _ = reader.interface.discardRemaining() catch {};
+        return received;
+    }
+};
+
+test "PG: empty bpchar" {
+    defer t.reset();
+
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    var row = (try c.row("select ''::bpchar, '{\"\"}'::bpchar[]", .{})).?;
+    defer row.deinit() catch {};
+
+    try t.expectEqual(' ', try row.get(u8, 0));
+    try t.expectSlice(u8, &.{' '}, try (try row.iterator(u8, 1)).alloc(t.arena.allocator()));
 }
 
 test "PG: bind []const u8" {

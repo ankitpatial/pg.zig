@@ -57,28 +57,28 @@ while (try result.next()) |row| {
 ```
 
 ## Pool
-The pool keeps a configured number of database connection open. The `acquire()` method is used to retrieve a connection from the pool. The pool may start one background thread to attempt to reconnect disconnected connections (or connections which are in an invalid state).
+The pool holds up to `size` database connections. The `acquire()` method is used to retrieve a connection from the pool. When no idle connection is available and the pool holds fewer than `size` connections, `acquire()` opens a new one. A connection released in an invalid state (e.g. after an error mid-query) is closed, and a new one is opened the next time one is needed.
 
 ### init(io: std.Io, allocator: std.mem.allocator, opts: Opts) !\*Pool
 Initializes a connection pool. Pool options are:
 
-* `size` - Number of connections to maintain. Defaults to `10`.
+* `size` - Maximum number of connections. Defaults to `10`.
 * `auth`: - See [Conn.auth](#authopts-opts-void)
 * `connect`: - See the [Conn.open](#openallocator-stdmemallocator-opts-opts-conn).
 * `timeout`: - The amount of time, in milliseconds, to wait for a connection to be available when `acquire()` is called.
-* `connect_on_init_count`:  - The # of connections in the pool to eagerly connect during `init`. Defaults to `null` which will initiliaze all connections (`size`). The background reconnector is used to setup the remaining (`size - connect_on_init_count`) connections. This can be set to `0`, to prevent `init` from failing except in extreme cases (i.e. OOM), but that will hide any configuration/connection issue until the first query is executed.
+* `connect_on_init_count`:  - The # of connections in the pool to eagerly connect during `init`. Defaults to `null` which will initiliaze all connections (`size`). The remaining (`size - connect_on_init_count`) connections are opened on demand by `acquire()`. This can be set to `0`, to prevent `init` from failing except in extreme cases (i.e. OOM), but that will hide any configuration/connection issue until the first query is executed.
 
 ### initUri(io: std.Io, allocator: std.mem.Allocator, uri: std.Uri, opts: Opts) !\*Pool
-Initializes a connection pool using a std.Uri. When using this function, the `auth` and `connect` fields of `opts` should **not** be set, as these will automatically set based on the provided `uri`.
+Initializes a connection pool using a std.Uri. The URI sets the username, password, database and `auth.timeout` (from `tcp_user_timeout`), and the host, port and `tls` (from `sslmode`); whatever `opts` has for those is ignored. The rest of `opts`, such as `connect_on_init_count`, `connect.read_buffer` or `auth.application_name`, is used as given.
 
 ```zig
 const uri = try std.Uri.parse("postgresql://username:password@localhost:5432/database_name");
-const pool = try pg.Pool.initUri(allocator, uri, 5, 10_000);
+const pool = try pg.Pool.initUri(io, allocator, uri, .{ .size = 5, .timeout = 10_000 });
 defer pool.deinit();
 ```
 
 ### acquire() !\*Conn
-Returns a [\*Conn](#conn) for the connection pool. Returns an `error.Timeout` if the connection cannot be acquired (i.e. if the pool remains empty) for the  `timeout` configuration passed to `init`.
+Returns a [\*Conn](#conn) for the connection pool. If a new connection has to be opened and that fails, the error is returned. Returns an `error.Timeout` if the connection cannot be acquired (i.e. if all `size` connections remain in use) for the  `timeout` configuration passed to `init`.
 
 
 ```zig
@@ -110,7 +110,7 @@ Opens a connection, or returns an error. Prefer creating connections through the
 * `host` - Defaults to `"127.0.0.1"`
 * `port` - Defaults to `5432`
 * `write_buffer` - Size of the write buffer, used when sending messages to the server. Will temporarily allocate more space as needed. If you're writing large SQL or have large parameters (e.g. long text values), making this larger might improve performance a little. Defaults to `2048`, cannot be less than `128`.
-* `read_buffer` - Size of the read buffer, used when reading data from the server. Will temporarily allocate more space as needed. Given most apps are going to be reading rows of data, this can have large impact on performance. Defaults to `4096`.
+* `read_buffer` - Size of the read buffer, used when reading data from the server. Will temporarily allocate more space as needed. Given most apps are going to be reading rows of data, this can have large impact on performance. Defaults to `8192`.
 * `result_state_size` - Each `Result` (retrieved via a call to `query`) carries metadata about the data (e.g. the type of each column). For results with less than or equal to `result_state_size` columns, a static `state` container is used. Queries with more columns require a dynamic allocation. Defaults to `32`. 
 * `keepalive` - Enables `SO_KEEPALIVE` on the socket. This is recommended (and on by default) so that idle pooled connections silently dropped by a NAT/conntrack/load-balancer are detected by the kernel rather than only surfacing on the next query. Ignored for unix-socket connections. Defaults to `true`.
 * `keepalive_idle` - Seconds a connection must be idle before the first keepalive probe is sent (`TCP_KEEPIDLE`/`TCP_KEEPALIVE`). Set to `null` to leave it at the OS default. Defaults to `30`.
@@ -129,6 +129,8 @@ Authentications the request. Prefer creating connections through the pool. Auth 
 * `timeout` : Defaults to `10_000` (milliseconds)
 * `application_name`: Defaults to `null`
 * `params`: Defaults to `null`. An `std.StringHashMap([]const u8)`
+* `auth_methods`: The authentication methods the client will go along with: `none` (the server doesn't ask for a password, e.g. `trust`), `password` (cleartext), `md5` and `scram_sha_256`. The server picks the method, so unless the server's certificate is verified (`tls = .verify_full`), a man-in-the-middle can ask for the password in cleartext. If the server asks for a method that isn't allowed, `auth` returns `error.AuthMethodNotAllowed` without sending anything. `.scram_only` allows only SCRAM-SHA-256. Defaults to all methods allowed.
+* `max_scram_iterations`: The most PBKDF2 iterations SCRAM will run. The server sets the count, so this limits how long a hostile server can keep the client busy. Beyond it, `auth` returns `error.TooManySCRAMIterations`. PostgreSQL defaults to `4096`. Defaults to `1_000_000`.
 
 ### release(conn: \*Conn) void
 Releases the connection back to the pool. The pool might decide to close the connection and open a new one.
@@ -158,6 +160,9 @@ Creates a [Stmt](#stmt). It is generally better to use `query`, `row` or `exec`.
 
 ### prepareOpts(sql: []const u8, opts: Conn.QueryOpts) !Stmt
 Same as `prepare` but takes the same options as `queryOpts`.
+
+### describe(allocator: Allocator, sql: []const u8) !QueryDescription
+Sends `Parse` + `Describe` + `Sync` and returns the parameter types and result columns of the statement, without executing it.
 
 ### begin() !void
 Calls `_ = try execOpts("begin", .{}, .{})`
