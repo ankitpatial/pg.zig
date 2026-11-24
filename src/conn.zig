@@ -695,12 +695,12 @@ pub const Conn = struct {
             if (!released) self.traceEnd(start, sql, null, err);
             return err;
         };
-        self.traceEnd(start, sql, affected, null);
+        if (!released) self.traceEnd(start, sql, affected, null);
         return affected;
     }
 
-    /// A failure that releases the connection (opts.release_conn) traces
-    /// before the release, from `start`, and sets `released`.
+    /// A statement that releases the connection (opts.release_conn) is
+    /// traced before the release, from `start`, and sets `released`.
     fn execUntraced(self: *Conn, start: ?Io.Timestamp, sql: []const u8, values: anytype, opts: QueryOpts, released: *bool) !?i64 {
         if (self.canQuery() == false) {
             return error.ConnectionBusy;
@@ -710,6 +710,7 @@ pub const Conn = struct {
 
         if (values.len == 0) {
             try self._reader.startFlow(opts.allocator, opts.timeout);
+            // Deferred to the end: the reply is read within the flow.
             defer self._reader.endFlow() catch {
                 // this can only fail in extreme conditions (OOM) and it will only impact
                 // the next query (and if the app is using the pool, the pool will try to
@@ -722,26 +723,45 @@ pub const Conn = struct {
             lib.metrics.query();
             self._state = .query;
             try self.write(buf.string());
-        } else {
-            // TODO: there's some optimization opportunities here, since we know
-            // we aren't expecting any result. We don't have to ask PG to DESCRIBE
-            // the returned columns (there should be none). This is very significant
-            // as it would remove 1 back-and-forth. We could just:
-            //    Parse + Bind + Exec + Sync
-            // Instead of having to do:
-            //    Parse + Describe + Sync  ... read response ...  Bind + Exec + Sync
-            // Not queryOpts: this statement is traced once, by execOpts.
-            const result = self.doQuery(sql, values, opts) catch |err| {
-                if (opts.release_conn) {
-                    self.traceEnd(start, sql, null, err);
-                    released.* = true;
-                    self.release();
-                }
-                return err;
-            };
-            result.deinit();
+            return self.readExecReply();
         }
 
+        // TODO: there's some optimization opportunities here, since we know
+        // we aren't expecting any result. We don't have to ask PG to DESCRIBE
+        // the returned columns (there should be none). This is very significant
+        // as it would remove 1 back-and-forth. We could just:
+        //    Parse + Bind + Exec + Sync
+        // Instead of having to do:
+        //    Parse + Describe + Sync  ... read response ...  Bind + Exec + Sync
+        // Not queryOpts: this statement is traced once, by execOpts.
+        const result = self.doQuery(sql, values, opts) catch |err| {
+            if (opts.release_conn) {
+                self.traceEnd(start, sql, null, err);
+                released.* = true;
+                self.release();
+            }
+            return err;
+        };
+        // The reply is read before deinit ends the statement's flow and, with
+        // release_conn, hands the connection back; traced before that too.
+        defer result.deinit();
+        const affected = self.readExecReply() catch |err| {
+            if (opts.release_conn) {
+                self.traceEnd(start, sql, null, err);
+                released.* = true;
+            }
+            return err;
+        };
+        if (opts.release_conn) {
+            self.traceEnd(start, sql, affected, null);
+            released.* = true;
+        }
+        return affected;
+    }
+
+    /// Reads an exec's reply up to ReadyForQuery: its rows affected, or the
+    /// rows counted when the statement returned some.
+    fn readExecReply(self: *Conn) !?i64 {
         // affected can be null, so we need a separate boolean to track if we
         // actually have a response.
         var affected: ?i64 = null;
@@ -1046,6 +1066,47 @@ test "Conn: exec query that returns rows" {
     _ = try c.exec("insert into simple_table values ('exec_sel_1'), ('exec_sel_2')", .{});
     try t.expectEqual(0, c.exec("select * from simple_table where value = 'none'", .{}));
     try t.expectEqual(2, c.exec("select * from simple_table where value like $1", .{"exec_sel_%"}));
+}
+
+// Rows larger than the 8 KB read buffer make the reader allocate a dynamic
+// one. Whoever allocated it must free it, whatever flow comes next.
+test "Conn: exec with values of a large row, then larger rows" {
+    var c = try t.connect(.{ .read_buffer = 8192 });
+    defer c.deinit();
+
+    try t.expectEqual(1, c.exec("select repeat('a', $1)", .{20_000}));
+    try expectRowLength(&c, "select repeat('b', $1)", 40_000, .{});
+    try expectRowLength(&c, "select repeat('c', $1)", 10, .{});
+}
+
+test "Conn: exec without values of a large row, then a cached statement" {
+    var c = try t.connect(.{ .read_buffer = 8192 });
+    defer c.deinit();
+
+    try t.expectEqual(1, c.exec("select repeat('a', 20000)", .{}));
+    try expectRowLength(&c, "select repeat('b', $1)", 30_000, .{ .cache_name = "large_row" });
+    try expectRowLength(&c, "select repeat('b', $1)", 40_000, .{ .cache_name = "large_row" });
+    try expectRowLength(&c, "select repeat('c', $1)", 10, .{});
+}
+
+test "Conn: a large row's buffer is not leaked" {
+    var c = try t.connect(.{ .read_buffer = 8192 });
+    defer c.deinit();
+
+    const sql = "select repeat('b', $1)";
+    try expectRowLength(&c, sql, 10, .{ .cache_name = "large_row_leak" });
+    try t.expectEqual(1, c.exec("select repeat('a', 20000)", .{}));
+
+    // The cached statement's arena already holds allocations, so it cannot
+    // grow a buffer it does not own in place: it copies it and "frees" the
+    // original, which an arena never does.
+    try expectRowLength(&c, sql, 40_000, .{ .cache_name = "large_row_leak" });
+}
+
+fn expectRowLength(c: *Conn, sql: []const u8, len: i32, opts: Conn.QueryOpts) !void {
+    var row = (try c.rowOpts(sql, .{len}, opts)).?;
+    defer row.deinit() catch {};
+    try t.expectEqual(@as(usize, @intCast(len)), (try row.get([]const u8, 0)).len);
 }
 
 test "Conn: parse error" {

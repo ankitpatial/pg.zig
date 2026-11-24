@@ -812,6 +812,16 @@ fn backendPid(pool: *Pool) !i32 {
     return row.get(i32, 0);
 }
 
+test "Pool: exec with values and release_conn reads its reply first" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
+    defer pool.deinit();
+
+    // The reply is read before the connection goes back, idle, to the pool.
+    const conn = try pool.acquire();
+    try t.expectEqual(1, conn.execOpts("select $1::int", .{1}, .{ .release_conn = true }));
+    try expectStats(pool, .{ .size = 1, .available = 1, .missing = 0, .in_use = 0 });
+}
+
 test "Pool: Release" {
     var pool = try Pool.init(t.io, t.allocator, .{
         .size = 2,

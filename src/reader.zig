@@ -36,6 +36,11 @@ fn ReaderT(comptime T: type) type {
         // buffer to read into
         buf: []u8,
 
+        // Owns `buf` when it isn't `static`: the allocator that was current
+        // when it was allocated. A flow can end while `buf` outlives it, so
+        // `allocator` can't be trusted to free or grow it.
+        buf_allocator: Allocator,
+
         // start within buf of the next message
         start: usize = 0,
 
@@ -54,13 +59,14 @@ fn ReaderT(comptime T: type) type {
                 .static = static,
                 .has_timeout = false,
                 .allocator = allocator,
+                .buf_allocator = allocator,
                 .default_allocator = allocator,
             };
         }
 
         pub fn deinit(self: Self) void {
             if (self.static.ptr != self.buf.ptr) {
-                self.allocator.free(self.buf);
+                self.buf_allocator.free(self.buf);
             }
             self.default_allocator.free(self.static);
         }
@@ -88,17 +94,15 @@ fn ReaderT(comptime T: type) type {
         }
 
         pub fn endFlow(self: *Self) !void {
-            const buf = self.buf;
-            const allocator = self.allocator;
+            const default_allocator = self.default_allocator;
+            self.allocator = default_allocator;
 
-            self.allocator = self.default_allocator;
+            const buf = self.buf;
             if (self.static.ptr == buf.ptr) {
                 // we never created a dynamic buffer
                 return;
             }
-
-            // even if the following fails, we want to free this
-            defer allocator.free(buf);
+            const owner = self.buf_allocator;
 
             // Normally, when an "flow" ends, we expect our read buffer to be empty.
             // This is true because data from PG is normally only sent in response
@@ -110,37 +114,45 @@ fn ReaderT(comptime T: type) type {
             const start = self.start;
             const extra = pos - start;
 
-            var new_buf: []u8 = undefined;
             if (extra > self.static.len) {
                 // This is unusual. Not only did we overread, but we've overread so
                 // much that we can't use our static buffer.
-
-                const default_allocator = self.default_allocator;
-                if (allocator.ptr == default_allocator.ptr) {
-                    // The dynamic buffer was allocated with our default allocator, so
-                    // we can keep it as-is
+                if (sameAllocator(owner, default_allocator)) {
+                    // our default allocator owns it, so we can keep it as-is
                     return;
                 }
 
-                // This is the worst. We have extra data in our dynamically buffer AND
-                // we have a query-specific allocator. This data _cannot_ remain
-                // where it is (because we have no guarantee that the allocator is valid
-                // beyond this query).
-                // So we'll copy it to a new buffer using our default allocator.
-                new_buf = try default_allocator.dupe(u8, self.buf[start..pos]);
-            } else {
-                // We either have no extra data, or we have extra data, but it fits in
-                // our static buffer. Either way, we're reverting self.buf to self.static;
-                new_buf = self.static;
-                if (extra > 0) {
-                    // We read extra data, copy this into our static buffer
-                    @memcpy(new_buf[0..extra], self.buf[start..pos]);
-                }
+                // The query-specific allocator owns it and may not outlive the
+                // query, so the data moves to a buffer of our default allocator.
+                const new_buf = default_allocator.dupe(u8, buf[start..pos]) catch |err| {
+                    // the data is lost either way; don't keep a buffer we don't own
+                    self.useStatic(0);
+                    owner.free(buf);
+                    return err;
+                };
+                owner.free(buf);
+                self.buf = new_buf;
+                self.buf_allocator = default_allocator;
+                self.start = 0;
+                self.pos = extra;
+                return;
             }
 
-            self.pos = extra;
+            // We either have no extra data, or we have extra data, but it fits in
+            // our static buffer. Either way, we're reverting self.buf to self.static;
+            if (extra > 0) {
+                @memcpy(self.static[0..extra], buf[start..pos]);
+            }
+            self.useStatic(extra);
+            owner.free(buf);
+        }
+
+        // Points buf back at static, holding `len` bytes of unread data.
+        fn useStatic(self: *Self, len: usize) void {
+            self.buf = self.static;
+            self.buf_allocator = self.default_allocator;
             self.start = 0;
-            self.buf = new_buf;
+            self.pos = len;
         }
 
         // If you execute "select * from invalid_table", PostgreSQL will return
@@ -192,17 +204,19 @@ fn ReaderT(comptime T: type) type {
 
                         if (message_length > buf.len) {
                             var new_buf: []u8 = undefined;
-                            const allocator = self.allocator;
 
                             if (buf.ptr == self.static.ptr) {
                                 //currently using our static buffer, we need to allocate a larger one
+                                const allocator = self.allocator;
                                 new_buf = try allocator.alloc(u8, message_length);
                                 @memcpy(new_buf[0..current_length], buf[start..pos]);
+                                self.buf_allocator = allocator;
                                 lib.metrics.allocReader(message_length);
                             } else {
                                 // currently using a dynamically allocated buffer, we'll
-                                // grow or allocate a larger one (which is what realloc does)
-                                new_buf = try allocator.realloc(buf, message_length);
+                                // grow or allocate a larger one (which is what realloc does),
+                                // with whichever allocator owns it
+                                new_buf = try self.buf_allocator.realloc(buf, message_length);
                                 if (start > 0) {
                                     std.mem.copyForwards(u8, new_buf[0..current_length], new_buf[start..pos]);
                                 }
@@ -281,6 +295,10 @@ fn ReaderT(comptime T: type) type {
             };
         }
     };
+}
+
+fn sameAllocator(a: Allocator, b: Allocator) bool {
+    return a.ptr == b.ptr and a.vtable == b.vtable;
 }
 
 pub const Message = struct {
@@ -759,4 +777,90 @@ test "Reader: startFlow with dynamic allocation into deinit " {
     try reader.startFlow(t.arena.allocator(), null);
     const msg1 = try reader.next();
     try t.expectSlice(u8, &.{ 1, 2, 3, 4 }, msg1.data);
+}
+
+// A message of `len` data bytes, all `kind`.
+fn testMessage(comptime kind: u8, comptime len: u32) [len + 5]u8 {
+    var msg: [len + 5]u8 = @splat(kind);
+    std.mem.writeInt(u32, msg[1..5], len + 4, .big);
+    return msg;
+}
+
+test "Reader: a default buffer grown in an arena's flow" {
+    const R = ReaderT(*t.Stream);
+    var s = t.Stream.init();
+    defer s.deinit();
+
+    // Grown outside any flow (default allocator), then grown again in a flow
+    // whose arena already holds memory: the arena must not take over, and
+    // lose, the default allocator's buffer.
+    var reader = R.init(t.allocator, 10, s) catch unreachable;
+    defer reader.deinit();
+
+    s.add(&testMessage(1, 30));
+    try t.expectEqual(30, (try reader.next()).data.len);
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    _ = try arena.allocator().alloc(u8, 1);
+
+    try reader.startFlow(arena.allocator(), null);
+    s.add(&testMessage(2, 60));
+    try t.expectEqual(60, (try reader.next()).data.len);
+    try reader.endFlow();
+
+    s.add(&testMessage(3, 2));
+    try t.expectEqual(2, (try reader.next()).data.len);
+}
+
+test "Reader: a flow ends with more unread data than the static buffer" {
+    const R = ReaderT(*t.Stream);
+    var s = t.Stream.init();
+    defer s.deinit();
+
+    // The dynamic buffer is kept, so it must not be freed.
+    var reader = R.init(t.allocator, 10, s) catch unreachable;
+    defer reader.deinit();
+
+    try reader.startFlow(null, null);
+    s.add(&testMessage(1, 60));
+    try t.expectEqual(60, (try reader.next()).data.len);
+    s.add(&(testMessage(2, 1) ++ testMessage(3, 40)));
+    try t.expectEqual(1, (try reader.next()).data.len);
+    try reader.endFlow();
+
+    const msg = try reader.next();
+    try t.expectEqual(3, msg.type);
+    try t.expectSlice(u8, &@as([40]u8, @splat(3)), msg.data);
+}
+
+test "Reader: unread data in an arena's buffer outlives the flow" {
+    const R = ReaderT(*t.Stream);
+    var s = t.Stream.init();
+    defer s.deinit();
+
+    // The unread data moves to the default allocator, which a later flow,
+    // with another arena, can grow.
+    var reader = R.init(t.allocator, 10, s) catch unreachable;
+    defer reader.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+
+    try reader.startFlow(arena.allocator(), null);
+    s.add(&testMessage(1, 60));
+    try t.expectEqual(60, (try reader.next()).data.len);
+    s.add(&(testMessage(2, 1) ++ testMessage(3, 40)));
+    try t.expectEqual(1, (try reader.next()).data.len);
+    try reader.endFlow();
+
+    var arena2 = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena2.deinit();
+    _ = try arena2.allocator().alloc(u8, 1);
+
+    try reader.startFlow(arena2.allocator(), null);
+    try t.expectEqual(40, (try reader.next()).data.len);
+    s.add(&testMessage(4, 100));
+    try t.expectEqual(100, (try reader.next()).data.len);
+    try reader.endFlow();
 }
